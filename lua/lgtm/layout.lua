@@ -192,17 +192,26 @@ local function split_path(path, budget)
     return dir, name
 end
 
--- The AI headers' ramp: magenta washing outward to pink-white, one shade per
--- letter, the last covering the tail. These are the RGB values of the xterm
--- steps 201→207→213→219→225 — the same wash codex's `ultra` effort wears.
-local AI_RAMP = { "#ff00ff", "#ff5fff", "#ff87ff", "#ffafff", "#ffd7ff" }
+-- The AI headers' ramps: one shade per letter, the last covering the tail.
+-- "ai" is magenta washing outward to pink-white — the RGB values of xterm
+-- 201→207→213→219→225, the same wash codex's `ultra` effort wears — and
+-- carries EXPLAIN and CHAPTERS. "review" is lilac cooling into teal, xterm
+-- 183→111→117→116→115, so the review column reads as the same family with a
+-- different job.
+local RAMPS = {
+    ai = { "#ff00ff", "#ff5fff", "#ff87ff", "#ffafff", "#ffd7ff" },
+    review = { "#d7afff", "#87afff", "#87d7ff", "#87d7d7", "#87d7af" },
+}
 
 --- Paint a winbar label one character per ramp shade. The result is a
 --- statusline expression; feed it plain ASCII only.
-function M.ai_label(text)
+--- @param ramp string|nil "ai" (default) or "review"
+function M.ai_label(text, ramp)
+    ramp = RAMPS[ramp] and ramp or "ai"
+    local group = ramp == "ai" and "LgtmWinbarAI" or "LgtmWinbarReview"
     local parts = {}
     for i = 1, #text do
-        table.insert(parts, string.format("%%#LgtmWinbarAI%d#%s", math.min(i, #AI_RAMP), text:sub(i, i)))
+        table.insert(parts, string.format("%%#%s%d#%s", group, math.min(i, #RAMPS[ramp]), text:sub(i, i)))
     end
     return table.concat(parts)
 end
@@ -218,10 +227,13 @@ function M.setup_winbar_highlights()
     -- The headers of the AI-generated panes — the chapter picker and the
     -- explanation column — so generated content is labelled at a glance. The
     -- icon takes the ramp's full magenta; the label washes out across it.
-    for i, fg in ipairs(AI_RAMP) do
+    for i, fg in ipairs(RAMPS.ai) do
         vim.api.nvim_set_hl(0, "LgtmWinbarAI" .. i, { fg = fg, bold = true })
     end
-    vim.api.nvim_set_hl(0, "LgtmWinbarAIIcon", { fg = AI_RAMP[1], bold = true })
+    for i, fg in ipairs(RAMPS.review) do
+        vim.api.nvim_set_hl(0, "LgtmWinbarReview" .. i, { fg = fg, bold = true })
+    end
+    vim.api.nvim_set_hl(0, "LgtmWinbarAIIcon", { fg = RAMPS.ai[1], bold = true })
 end
 
 --- Show one file's before/after pair.

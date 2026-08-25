@@ -923,7 +923,9 @@ local function set_review_winbar(session, note)
     end
     vim.wo[session.review_win].winbar = table.concat({
         "%#LgtmWinbarAIIcon# 󰙴 ",
-        require("lgtm.layout").ai_label("REVIEW"),
+        -- The review ramp: lilac into teal, against the magenta wash of the
+        -- other AI headers.
+        require("lgtm.layout").ai_label("REVIEW", "review"),
         "  %#LgtmWinbarDim#%=",
         (note or ""):gsub("%%", "%%%%"),
         " ",
