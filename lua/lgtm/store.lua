@@ -92,7 +92,9 @@ end
 
 --- Delete every stored explanation for one path, whichever runs wrote them.
 --- This is what a targeted regeneration clears — filename alone cannot find
---- them, since each run writes under its own tag.
+--- them, since each run writes under its own tag. Review files are left
+--- alone: regenerating a file's explanation is not a reason to lose its
+--- review findings.
 --- @return number files deleted
 function M.delete_path(dir, path)
     local n = 0
@@ -100,7 +102,13 @@ function M.delete_path(dir, path)
         return 0
     end
     for name, kind in vim.fs.dir(dir) do
-        if kind == "file" and name:match("%.json$") and not name:match("^_") and name ~= "guide.json" then
+        if
+            kind == "file"
+            and name:match("%.json$")
+            and not name:match("^_")
+            and not name:match("%.review%.json$")
+            and name ~= "guide.json"
+        then
             local file = vim.fs.joinpath(dir, name)
             local data = read_json(file)
             if data and data.path == path and vim.fn.delete(file) == 0 then
@@ -109,6 +117,39 @@ function M.delete_path(dir, path)
         end
     end
     return n
+end
+
+--- Every review finding in the store, indexed by path then role. Several runs
+--- may cover one path — different roles, or one role over two chapters — and
+--- their comment lists merge, in sorted filename order so the result is
+--- stable.
+--- @return table map path -> map role -> comments[]
+function M.load_reviews(dir)
+    local out = {}
+    if vim.fn.isdirectory(dir) == 0 then
+        return out
+    end
+    local names = {}
+    for name, kind in vim.fs.dir(dir) do
+        if kind == "file" and name:match("%.review%.json$") and not name:match("^_") then
+            table.insert(names, name)
+        end
+    end
+    table.sort(names)
+    for _, name in ipairs(names) do
+        local data = read_json(vim.fs.joinpath(dir, name))
+        if
+            data
+            and type(data.path) == "string"
+            and type(data.role) == "string"
+            and type(data.comments) == "table"
+        then
+            out[data.path] = out[data.path] or {}
+            out[data.path][data.role] = out[data.path][data.role] or {}
+            vim.list_extend(out[data.path][data.role], data.comments)
+        end
+    end
+    return out
 end
 
 --- The reviewer guide: the guide run's one output, splitting the change into

@@ -77,6 +77,7 @@ pass one explicitly: `:LgtmEdit origin/release-2`.
 | `<S-PageDown>` / `<S-PageUp>` | any pane | same, alternate binding |
 | `<End>` | any pane | toggle viewed — ticking advances to the next file |
 | `<leader>ge` | any pane | toggle the AI comments column |
+| `<leader>gw` | any pane | pick AI reviewers (one or many) |
 | `]c` / `[c` | diff panes | next / previous hunk (Vim built-in) |
 | `<CR>` | tree | open file, or fold a directory |
 | `v` | tree | toggle viewed |
@@ -156,6 +157,48 @@ to that chapter's files, and the description pane swaps to the chapter's summary
 "ALL" restores the full tree and the PR body. A file can belong to
 several chapters or to none, and the guide is cached with the explanations, so
 it is there instantly on the next session.
+
+## The AI review column
+
+```
+:LgtmReview              pick reviewers from a checklist    <leader>gw
+:LgtmReview security ai  run those reviewers directly
+:LgtmReviewClose         close the review column
+```
+
+A panel of specialist reviewers — review-backend, review-frontend,
+review-security, review-ai, review-code-quality, review-ai-slop, review-tests,
+review-architecture — each with its own serious brief and a shared
+reference-manual house style. `<leader>gw` opens a checklist: tick one or many
+(`<Space>` toggles, `a` marks all, `<CR>` launches), and each ticked role
+reviews the **selected chapter** — or the whole change on "ALL" — as its own
+parallel run.
+
+Findings attach to the same diff regions as the explanations and render in a
+fifth column, right of the AI comments (or right of the working file when that
+column is closed). Every role writes in its own colour, and a legend window at
+the bottom of the column is the key:
+
+```
+│ 󰙴 REVIEW                        │
+│  ▌ 120–134                      │
+│  ● review-security — SQL built  │
+│    by string concatenation      │
+│    `build_query` interpolates…  │
+│                                 │
+│  ● review-tests — no test for   │
+│    the new fallback branch      │
+├─────────────────────────────────┤
+│  ● review-security              │
+│  ● review-tests                 │
+└─────────────────────────────────┘
+```
+
+A reviewer with nothing to say writes nothing — silent regions stay blank, and
+an empty review is a valid review. Findings are cached with the explanations,
+per branch. The review column has its own lifecycle: it stays up when
+`<leader>ge` closes the comments column, and closes with `:LgtmReviewClose` or
+the session.
 
 ## Picking a branch
 

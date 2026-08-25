@@ -139,6 +139,59 @@ Rules about the run itself:
   * You cannot write anywhere except the output directory, by design. Do not try.
 ]]
 
+-- Phase 4, on demand: one specialist reviewer judging one chapter (or the
+-- whole change). Shares the explain contract's framing — the unit is the
+-- cumulative diff, never the commits — but the job is judging, not describing.
+local REVIEW_CONTRACT = [[
+You are one specialist reviewer on a panel reviewing a pull request. Your role
+and its brief are given in the request; judge ONLY what your role covers, and
+trust the rest of the panel to cover theirs.
+
+WHAT IS UNDER REVIEW is the cumulative difference between the base branch's
+merge base and the working tree — the same thing GitHub shows on the PR, NOT
+the branch's individual commits. Never cite a commit hash, and never reach for
+`git log` or `git blame` to find something to say.
+
+You may be given ONE CHAPTER of the PR: a title, a summary, and the files that
+make it up. Files outside your list are context, not work: read them where
+they inform a finding, and never write output for them.
+
+You have read access to the whole repository. Use it: a finding backed by the
+caller you found, the test that is missing, or the sink the input reaches is a
+finding; a finding backed by a hunch is not.
+
+You produce no prose for the user. Your entire output is files written with
+the Write tool, one per file in your list that you have findings for, into the
+output directory named in the request. Prefix every filename with the run tag
+you are given:
+
+  <output_dir>/<run_tag>.<the file's path with every / replaced by __>.review.json
+
+Each contains exactly this, and nothing else:
+
+{"path":"<the file's path, exactly as given to you>",
+ "role":"<your role key, exactly as given>",
+ "comments":[{"start":120,"end":134,"title":"...","body":"..."}]}
+
+  * "start" and "end" are line numbers in the NEW version of that file — the
+    right-hand side of the diff. For a finding about deleted lines, use the new
+    line number they sat after, for both.
+  * "title" is one line, at most 60 characters, no trailing full stop: the
+    finding, not its category.
+  * "body" is 1-4 sentences of markdown: the finding, the evidence, and — where
+    one exists — the concrete fix. Follow the house style in your brief.
+  * A file with no findings gets NO output file. An empty review is a valid
+    review.
+
+Rules about the run itself:
+
+  * WRITE EACH FILE AS SOON AS YOU HAVE FINISHED JUDGING IT. Do not batch the
+    writes to the end.
+  * Most of your diffs are pasted into the request; fetch anything missing with
+    `git diff`, Read and Grep rather than asking for it.
+  * You cannot write anywhere except the output directory, by design.
+]]
+
 local function pr_block(ctx)
     local pr = ctx.pr
     if type(pr) == "table" then
@@ -197,35 +250,26 @@ function M.build_guide_prompt(ctx)
     }, "\n\n")
 end
 
---- An explain run's prompt: the PR, the full stat for orientation, the chapter
---- (if any), the run's file list, and as many of their diffs as the byte budget
---- allows — largest saving of the phased design, since a chapter's diffs are a
---- fraction of the PR's.
---- @param ctx table { pr, branch, base_ref, merge_base, entries, chapter,
----        paths, diffs (path -> text), current, out_dir, only, budget }
-function M.build_explain_prompt(ctx)
-    local parts = { pr_block(ctx), change_block(ctx) }
-
+--- The chapter framing for a run, or the outside-every-chapter note.
+local function chapter_block(ctx, verb)
     if ctx.chapter then
-        table.insert(
-            parts,
-            string.format(
-                "<chapter title=%q>\n%s\n\nIts files:\n%s\n</chapter>",
-                tostring(ctx.chapter.title or ""),
-                vim.trim(ctx.chapter.summary or ""),
-                "  " .. table.concat(ctx.chapter.files or {}, "\n  ")
-            )
-        )
-    else
-        table.insert(
-            parts,
-            "<chapter>\nThese files sit outside every chapter of the reviewer guide; explain them on their own terms.\n</chapter>"
+        return string.format(
+            "<chapter title=%q>\n%s\n\nIts files:\n%s\n</chapter>",
+            tostring(ctx.chapter.title or ""),
+            vim.trim(ctx.chapter.summary or ""),
+            "  " .. table.concat(ctx.chapter.files or {}, "\n  ")
         )
     end
+    return string.format(
+        "<chapter>\nThese files sit outside every chapter of the reviewer guide; %s them on their own terms.\n</chapter>",
+        verb
+    )
+end
 
-    -- The run's diffs, open-now first, until the budget runs out. What does not
-    -- fit is named so the agent knows to fetch it rather than assume it saw
-    -- everything.
+--- The run's diffs, open-now first, until the byte budget runs out. What does
+--- not fit is named, so the agent knows to fetch it rather than assume it saw
+--- everything.
+local function append_diffs(parts, ctx)
     local ordered = {}
     for _, p in ipairs(ctx.paths or {}) do
         if p == ctx.current then
@@ -253,7 +297,18 @@ function M.build_explain_prompt(ctx)
                 .. "\n</not_pasted>"
         )
     end
+end
 
+--- An explain run's prompt: the PR, the full stat for orientation, the chapter
+--- (if any), the run's file list, and as many of their diffs as the byte budget
+--- allows — largest saving of the phased design, since a chapter's diffs are a
+--- fraction of the PR's.
+--- @param ctx table { pr, branch, base_ref, merge_base, entries, chapter,
+---        paths, diffs (path -> text), current, out_dir, only, budget }
+function M.build_explain_prompt(ctx)
+    local parts = { pr_block(ctx), change_block(ctx) }
+    table.insert(parts, chapter_block(ctx, "explain"))
+    append_diffs(parts, ctx)
     table.insert(parts, string.format("<output_dir>%s</output_dir>", ctx.out_dir))
     table.insert(parts, string.format("<run_tag>%s</run_tag>", ctx.run_tag or "run"))
 
@@ -278,6 +333,35 @@ function M.build_explain_prompt(ctx)
         )
     end
 
+    return table.concat(parts, "\n\n")
+end
+
+--- A review run's prompt: the PR, the stat, the chapter (if any), the role's
+--- brief, and the diffs under the same byte budget as an explain run.
+--- @param ctx table { pr, branch, base_ref, merge_base, entries, chapter,
+---        role = { key, title, preamble }, paths, diffs, current, out_dir,
+---        run_tag, budget }
+function M.build_review_prompt(ctx)
+    local parts = { pr_block(ctx), change_block(ctx) }
+    table.insert(parts, chapter_block(ctx, "review"))
+    table.insert(
+        parts,
+        string.format(
+            "<role key=%q title=%q>\n%s\n</role>",
+            tostring(ctx.role.key),
+            tostring(ctx.role.title),
+            ctx.role.preamble
+        )
+    )
+    append_diffs(parts, ctx)
+    table.insert(parts, string.format("<output_dir>%s</output_dir>", ctx.out_dir))
+    table.insert(parts, string.format("<run_tag>%s</run_tag>", ctx.run_tag or "review"))
+    table.insert(
+        parts,
+        "<files>\n  "
+            .. table.concat(ctx.paths or {}, "\n  ")
+            .. "\n</files>\n\nReview every file in <files> for your role, and write output only for those with findings."
+    )
     return table.concat(parts, "\n\n")
 end
 
@@ -450,5 +534,6 @@ end
 
 M.GUIDE_CONTRACT = GUIDE_CONTRACT
 M.EXPLAIN_CONTRACT = EXPLAIN_CONTRACT
+M.REVIEW_CONTRACT = REVIEW_CONTRACT
 
 return M

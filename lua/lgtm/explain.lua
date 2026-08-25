@@ -24,6 +24,7 @@ local ai = require("lgtm.ai")
 local colors = require("lgtm.colors")
 local git = require("lgtm.git")
 local markdown = require("lgtm.markdown")
+local reviewers = require("lgtm.reviewers")
 local state = require("lgtm.state")
 local store = require("lgtm.store")
 
@@ -44,12 +45,25 @@ function M.setup_highlights(diff_colors)
     vim.api.nvim_set_hl(0, "LgtmExplainDel", { fg = colors.accent("delete", opts) })
     -- No "active block" highlight: the panes are aligned row for row, so which
     -- explanation belongs to what you are looking at is answered by where it is.
+    reviewers.setup_highlights()
 end
 
 function M.is_open(session)
     return session ~= nil
         and session.explain_win ~= nil
         and vim.api.nvim_win_is_valid(session.explain_win)
+end
+
+--- The review column, which has its own lifecycle: it does not come and go
+--- with the explain column, only with the session.
+function M.review_open(session)
+    return session ~= nil
+        and session.review_win ~= nil
+        and vim.api.nvim_win_is_valid(session.review_win)
+end
+
+local function any_open(session)
+    return M.is_open(session) or M.review_open(session)
 end
 
 -- ---------------------------------------------------------------------------
@@ -228,14 +242,20 @@ end
 --- was folded — and that line is always inside the region's own unfolded context, so
 --- opening every fold in the file changed nothing it could see.
 local function layout_signature(session)
-    if not M.is_open(session) then
+    if not any_open(session) then
         return nil
     end
     local win = session.working_win
     if not (win and vim.api.nvim_win_is_valid(win)) then
         return nil
     end
-    local parts = { vim.api.nvim_win_get_width(session.explain_win) }
+    local parts = {}
+    if M.is_open(session) then
+        table.insert(parts, "e" .. vim.api.nvim_win_get_width(session.explain_win))
+    end
+    if M.review_open(session) then
+        table.insert(parts, "r" .. vim.api.nvim_win_get_width(session.review_win))
+    end
     for _, r in ipairs(session.explain_regions or {}) do
         table.insert(parts, rows_above(win, r.first))
     end
@@ -404,6 +424,71 @@ end
 --- Where a block is taller than the rows between its region and the next, it reports
 --- the shortfall rather than overlapping: the caller pads the code panes to open the
 --- gap and lays out again. That is the only reason padding exists.
+--- One block per region for the review column. Unlike the explain column, a
+--- region nobody found fault with renders nothing at all: a silent reviewer
+--- should not fill the pane with dots. Each finding is one heading line —
+--- `● <role> — <title>` — and its body, the whole comment tinted in the
+--- role's colour, with markdown's inline marks layered after the tint so code
+--- chips still read as chips.
+--- @param by_region table region index -> list of { role, title, body, group, lead }
+local function build_review_blocks(session, by_region, width)
+    local text_width = math.max(20, width - 4)
+    local blocks = {}
+    for i, r in ipairs(session.explain_regions or {}) do
+        local lines, marks = {}, {}
+        local items = by_region and by_region[i] or nil
+        if items and #items > 0 then
+            local head = string.format("  ▌ %s", span_label(r.first, r.last, r.added))
+            table.insert(lines, head)
+            table.insert(marks, { line = 0, col = 0, end_col = #head, hl = "LgtmExplainHead" })
+            for k, e in ipairs(items) do
+                if k > 1 then
+                    table.insert(lines, "")
+                end
+                local group = reviewers.hl_group(e.role.key)
+                if not e.lead then
+                    local lead = session.explain_regions[e.group[1]]
+                    local l = "    ↑ "
+                        .. e.role.title
+                        .. ": one finding with "
+                        .. span_label(lead.first, lead.last, lead.added)
+                    table.insert(lines, l)
+                    table.insert(marks, { line = #lines - 1, col = 0, end_col = #l, hl = "LgtmExplainMeta" })
+                else
+                    local heading = "● " .. e.role.title .. (e.title ~= "" and (" — " .. e.title) or "")
+                    for _, l in ipairs(markdown.wrap(heading, text_width, "  ")) do
+                        table.insert(lines, l)
+                        table.insert(marks, { line = #lines - 1, col = 0, end_col = #l, hl = group })
+                    end
+                    local indented = {}
+                    for _, bl in ipairs(vim.split(e.body, "\n", { plain = true })) do
+                        table.insert(indented, "    " .. bl)
+                    end
+                    local body_lines, body_marks = markdown.format(table.concat(indented, "\n"), text_width)
+                    local offset = #lines
+                    for bi, bl in ipairs(body_lines) do
+                        table.insert(lines, bl)
+                        -- The role tint first; the inline marks below layer on
+                        -- top of it, since later extmarks of equal priority win.
+                        table.insert(marks, { line = offset + bi - 1, col = 0, end_col = #bl, hl = group })
+                    end
+                    for _, m in ipairs(body_marks) do
+                        table.insert(marks, {
+                            line = m.line + offset,
+                            col = m.col,
+                            end_col = m.end_col,
+                            hl = m.hl,
+                            eol = m.eol,
+                        })
+                    end
+                end
+            end
+        end
+        blocks[i] = { lines = lines, marks = marks }
+    end
+    return blocks
+end
+
 --- @return table lines, table marks, table positions, table deficits
 local function place_blocks(session, blocks)
     local win = session.working_win
@@ -443,34 +528,98 @@ local function place_blocks(session, blocks)
     return lines, marks, positions, deficits
 end
 
---- Lay out, pad, lay out again. Two passes is enough: the first discovers every
---- shortfall, the padding opens exactly those gaps, and the second sees the rows it
---- asked for. A third is allowed only because padding is clamped near the end of the
---- file and can come up short there.
-local function render(session, by_region, width)
-    local blocks = build_blocks(session, by_region, width)
-    if #blocks == 0 then
-        session.explain_blocks = {}
-        markdown.apply(session.explain_buf, { "", "  Nothing to explain in this file." }, {
-            { line = 1, col = 0, end_col = 40, hl = "LgtmExplainMeta" },
-        })
+--- The review findings for one file, arranged per region with each comment
+--- carrying its role. Roles are walked in their fixed order, so two roles'
+--- findings on one region always stack the same way.
+local function review_by_region(session, entry)
+    local by_role = (session.review_store or {})[entry.path]
+    if not by_role then
+        return {}
+    end
+    local out = {}
+    for _, role in ipairs(reviewers.roles) do
+        local comments = by_role[role.key]
+        if comments and #comments > 0 then
+            local mapped = ai.map_to_regions(comments, session.explain_regions)
+            for i, list in pairs(mapped) do
+                out[i] = out[i] or {}
+                for _, item in ipairs(list) do
+                    item.role = role
+                    table.insert(out[i], item)
+                end
+            end
+        end
+    end
+    return out
+end
+
+--- Lay out every open column against the same rows: place each column's
+--- blocks, take the per-region MAXIMUM of their shortfalls, pad once, place
+--- again. The columns share the padding namespace, so letting them pad
+--- independently would have each clearing the other's rows.
+---
+--- Two passes is enough: the first discovers every shortfall, the padding
+--- opens exactly those gaps, and the second sees the rows it asked for. A
+--- third is allowed only because padding is clamped near the end of the file
+--- and can come up short there.
+--- @param explain_map table|nil region map for the explain column, or nil to
+---        leave that column's buffer untouched (it may be showing a status)
+local function render_columns(session, explain_map, review_map)
+    local cols = {}
+    if M.is_open(session) and explain_map then
+        cols.explain = build_blocks(session, explain_map, vim.api.nvim_win_get_width(session.explain_win))
+    end
+    if M.review_open(session) and review_map then
+        cols.review = build_review_blocks(session, review_map, vim.api.nvim_win_get_width(session.review_win))
+    end
+    if vim.tbl_isempty(cols) then
         return
     end
 
     clear_padding(session)
-    local lines, marks, positions
+    local placed = {}
     for _ = 1, 3 do
-        local deficits
-        lines, marks, positions, deficits = place_blocks(session, blocks)
-        if vim.tbl_isempty(deficits) or not apply_padding(session, deficits) then
+        placed = {}
+        local merged = {}
+        for name, blocks in pairs(cols) do
+            local lines, marks, positions, deficits = place_blocks(session, blocks)
+            placed[name] = { lines = lines, marks = marks, positions = positions }
+            for i, d in pairs(deficits) do
+                merged[i] = math.max(merged[i] or 0, d)
+            end
+        end
+        if vim.tbl_isempty(merged) or not apply_padding(session, merged) then
             break
         end
     end
 
-    session.explain_blocks = positions
-    markdown.apply(session.explain_buf, lines, marks)
-    session.explain_layout_width = width
+    if placed.explain then
+        session.explain_blocks = placed.explain.positions
+        markdown.apply(session.explain_buf, placed.explain.lines, placed.explain.marks)
+    end
+    if placed.review then
+        session.review_blocks = placed.review.positions
+        markdown.apply(session.review_buf, placed.review.lines, placed.review.marks)
+    end
     session.explain_sig = layout_signature(session)
+end
+
+--- Render whatever the current file has, into every open column.
+local function render_current(session)
+    local entry = session.entries[session.index]
+    if not entry then
+        return
+    end
+    local explain_map
+    local data = (session.explain_store or {})[entry.path]
+    if M.is_open(session) and data then
+        explain_map = ai.map_to_regions(data.explanations, session.explain_regions)
+    end
+    local review_map
+    if M.review_open(session) then
+        review_map = review_by_region(session, entry)
+    end
+    render_columns(session, explain_map, review_map)
 end
 
 
@@ -541,7 +690,7 @@ end
 --- the reliable reference — never inside a fold, and their canvas position was
 --- computed from the same measurement.
 function M.sync(session)
-    if syncing or not M.is_open(session) then
+    if syncing or not any_open(session) then
         return
     end
     local win = session.working_win
@@ -558,10 +707,13 @@ function M.sync(session)
     -- has neither, so its first drawn row is simply its top line.
     local top_row = vim.fn.screenpos(win, view.topline, 1).row - (view.topfill or 0)
 
+    -- Both canvases are laid out against the same rows, so one target serves
+    -- them both; the anchor comes from whichever column is open.
+    local anchor = M.is_open(session) and session.explain_blocks or session.review_blocks
     local target
     if top_row > 0 then
         for i, r in ipairs(session.explain_regions or {}) do
-            local block = (session.explain_blocks or {})[i]
+            local block = (anchor or {})[i]
             local row = block and vim.fn.screenpos(win, r.first, 1).row or 0
             if row > 0 then
                 -- The region sits (row - top_row) rows below the top line's own row;
@@ -576,17 +728,26 @@ function M.sync(session)
         -- Fall back to counting, which is right everywhere the padding is not.
         target = rows_above(win, view.topline) + 1
     end
-    target = math.max(1, math.min(target, vim.api.nvim_buf_line_count(session.explain_buf)))
+
+    local function set_top(pane_win, pane_buf)
+        local t = math.max(1, math.min(target, vim.api.nvim_buf_line_count(pane_buf)))
+        pcall(vim.api.nvim_win_call, pane_win, function()
+            local v = vim.fn.winsaveview()
+            if v.topline ~= t then
+                v.topline = t
+                v.lnum = math.max(v.lnum, t)
+                vim.fn.winrestview(v)
+            end
+        end)
+    end
 
     syncing = true
-    pcall(vim.api.nvim_win_call, session.explain_win, function()
-        local v = vim.fn.winsaveview()
-        if v.topline ~= target then
-            v.topline = target
-            v.lnum = math.max(v.lnum, target)
-            vim.fn.winrestview(v)
-        end
-    end)
+    if M.is_open(session) then
+        set_top(session.explain_win, session.explain_buf)
+    end
+    if M.review_open(session) then
+        set_top(session.review_win, session.review_buf)
+    end
     syncing = false
 end
 
@@ -598,13 +759,17 @@ end
 --- model call. Called from the session's cursor and scroll autocmds and guarded by
 --- the signature, so it is a no-op on almost every one of them.
 function M.relayout_if_stale(session)
-    if not M.is_open(session) then
+    if not any_open(session) then
         return
     end
     local entry = session.entries[session.index]
-    local data = entry and (session.explain_store or {})[entry.path] or nil
-    if not data then
-        -- Still waiting on the run, or showing an error. Nothing laid out to redo.
+    if not entry then
+        return
+    end
+    local has_explain = M.is_open(session) and (session.explain_store or {})[entry.path] ~= nil
+    local has_review = M.review_open(session) and next((session.review_store or {})[entry.path] or {}) ~= nil
+    if not (has_explain or has_review) then
+        -- Still waiting on the runs, or showing a status. Nothing laid out to redo.
         return
     end
     local sig = layout_signature(session)
@@ -615,11 +780,7 @@ function M.relayout_if_stale(session)
     -- autocmd that called this, and the stamp is what stops that re-entering.
     session.explain_sig = sig
 
-    render(
-        session,
-        ai.map_to_regions(data.explanations, session.explain_regions),
-        vim.api.nvim_win_get_width(session.explain_win)
-    )
+    render_current(session)
     M.sync(session)
 end
 
@@ -645,18 +806,39 @@ local function stop_timer(session)
     end
 end
 
---- Stop every run and drop the queue. Called when the session closes, not when
---- the reviewer pages: the runs are doing work for every file, so paging away
---- from the one that started them is not a reason to throw the rest away.
-local function stop_run(session)
-    stop_timer(session)
-    for _, run in pairs(session.explain_jobs or {}) do
-        pcall(function()
-            run.job:kill(15)
-        end)
+--- Kill the running jobs and drop the queued specs that `pred(spec)` selects.
+--- The explain and review columns have separate lifecycles, so closing one
+--- must not take the other's runs down with it.
+local function kill_jobs(session, pred)
+    for key, run in pairs(session.explain_jobs or {}) do
+        if pred(run.spec) then
+            pcall(function()
+                run.job:kill(15)
+            end)
+            session.explain_jobs[key] = nil
+        end
     end
-    session.explain_jobs = {}
-    session.explain_queue = {}
+    local rest = {}
+    for _, s in ipairs(session.explain_queue or {}) do
+        if not pred(s) then
+            table.insert(rest, s)
+        end
+    end
+    session.explain_queue = rest
+    if vim.tbl_isempty(session.explain_jobs or {}) and #rest == 0 then
+        stop_timer(session)
+    end
+end
+
+--- Stop every run and drop the whole queue. Called when the session closes,
+--- not when the reviewer pages: the runs are doing work for every file, so
+--- paging away from the one that started them is not a reason to throw the
+--- rest away.
+local function stop_run(session)
+    kill_jobs(session, function()
+        return true
+    end)
+    stop_timer(session)
 end
 
 M.stop_run = stop_run
@@ -682,7 +864,39 @@ local function scheduled(session, key)
     return false
 end
 
+--- Review runs currently in flight or queued.
+local function review_runs(session)
+    local n = 0
+    for _, run in pairs(session.explain_jobs or {}) do
+        if run.spec and run.spec.kind == "review" then
+            n = n + 1
+        end
+    end
+    for _, s in ipairs(session.explain_queue or {}) do
+        if s.kind == "review" then
+            n = n + 1
+        end
+    end
+    return n
+end
+
+local function set_review_winbar(session, note)
+    if not M.review_open(session) then
+        return
+    end
+    vim.wo[session.review_win].winbar = table.concat({
+        "%#LgtmWinbarAIIcon# 󰙴 ",
+        require("lgtm.layout").ai_label("REVIEW"),
+        "  %#LgtmWinbarDim#%=",
+        (note or ""):gsub("%%", "%%%%"),
+        " ",
+    })
+end
+
 local function render_progress(session, entry)
+    if not M.is_open(session) then
+        return
+    end
     local done, total = progress(session)
     local active = running(session)
     local secs = session.explain_started and math.floor((vim.uv.now() - session.explain_started) / 1000) or 0
@@ -743,10 +957,19 @@ function launch(session, spec)
         ctx.current = spec.current
         ctx.only = spec.only
         ctx.budget = cfg.max_diff_bytes
-        -- Each run writes under its own tag, so two chapters explaining a
-        -- shared file cannot overwrite one another; the store merges by path.
+        -- Each run writes under its own tag, so two runs covering a shared
+        -- file cannot overwrite one another; the store merges by path.
         ctx.run_tag = spec.key:gsub("[^%w%-]", "-")
-        prompt, contract = ai.build_explain_prompt(ctx), ai.EXPLAIN_CONTRACT
+        if spec.kind == "review" then
+            ctx.role = {
+                key = spec.role.key,
+                title = spec.role.title,
+                preamble = reviewers.preamble(spec.role),
+            }
+            prompt, contract = ai.build_review_prompt(ctx), ai.REVIEW_CONTRACT
+        else
+            prompt, contract = ai.build_explain_prompt(ctx), ai.EXPLAIN_CONTRACT
+        end
     end
 
     session.explain_started = session.explain_started or vim.uv.now()
@@ -754,7 +977,7 @@ function launch(session, spec)
         if session.explain_jobs then
             session.explain_jobs[spec.key] = nil
         end
-        if not M.is_open(session) then
+        if not any_open(session) then
             return
         end
         -- The results are files, so a failed run is not necessarily an empty
@@ -769,6 +992,9 @@ function launch(session, spec)
             schedule_runs(session)
         end
         pump(session)
+        if review_runs(session) == 0 then
+            set_review_winbar(session, "")
+        end
         if running(session) == 0 and #(session.explain_queue or {}) == 0 then
             stop_timer(session)
         end
@@ -785,12 +1011,22 @@ function launch(session, spec)
         local timer = vim.uv.new_timer()
         session.explain_timer = timer
         timer:start(1000, 1000, vim.schedule_wrap(function()
-            if not (M.is_open(session) and running(session) > 0) then
+            if not (any_open(session) and running(session) > 0) then
                 return
             end
             local e = session.entries[session.index]
             if e and not (session.explain_store or {})[e.path] then
                 render_progress(session, e)
+            end
+            local active = review_runs(session)
+            if active > 0 then
+                local secs = session.explain_started
+                        and math.floor((vim.uv.now() - session.explain_started) / 1000)
+                    or 0
+                set_review_winbar(
+                    session,
+                    string.format("%d reviewer%s · %ds", active, active == 1 and "" or "s", secs)
+                )
             end
         end))
     end
@@ -800,7 +1036,7 @@ end
 --- it is the only thing left: its files are the ones no chapter claimed, and
 --- "after the chapters" is part of its meaning.
 function pump(session)
-    if not M.is_open(session) then
+    if not any_open(session) then
         return
     end
     local cap = session.cfg.explain.max_parallel or 3
@@ -954,11 +1190,14 @@ end
 --- Called from the directory watcher, so this is what makes a single whole-PR run
 --- appear one file at a time.
 function M.reload(session)
-    if not M.is_open(session) then
+    if not any_open(session) then
         return
     end
-    local before = (session.explain_store or {})[(session.entries[session.index] or {}).path]
+    local current_path = (session.entries[session.index] or {}).path
+    local before = (session.explain_store or {})[current_path]
+    local reviews_before = vim.json.encode((session.review_store or {})[current_path] or {})
     session.explain_store = store.load(store_dir(session))
+    session.review_store = store.load_reviews(store_dir(session))
     -- The guide arrives through the same watcher as the explanations — it is the
     -- run's first write. Compared as JSON so a refinement at the end of the run
     -- also lands.
@@ -981,9 +1220,10 @@ function M.reload(session)
         return
     end
     local now = session.explain_store[entry.path]
-    if now and not before then
+    local reviews_now = vim.json.encode(session.review_store[entry.path] or {})
+    if (now and not before) or reviews_now ~= reviews_before then
         M.refresh(session)
-    elseif not now and session.explain_job then
+    elseif not now and running(session) > 0 then
         render_progress(session, entry)
     end
 end
@@ -992,7 +1232,7 @@ end
 --- while the run gets to it.
 --- @param opts table|nil `force` regenerates this one file
 function M.refresh(session, opts)
-    if not M.is_open(session) then
+    if not any_open(session) then
         return
     end
     opts = opts or {}
@@ -1002,15 +1242,23 @@ function M.refresh(session, opts)
     end
 
     -- No hunks means the pane below is not a diff: binary, deleted, too large.
-    -- There is nothing to key an explanation to.
+    -- There is nothing to key an explanation or a finding to.
     if not session.hunks or #session.hunks == 0 then
         session.explain_regions = {}
-        render_status(
-            session,
-            "no diff to explain",
-            "This file is shown without a diff — binary, deleted, or over `max_file_size`."
-        )
-        set_winbar(session, entry, "")
+        if M.is_open(session) then
+            render_status(
+                session,
+                "no diff to explain",
+                "This file is shown without a diff — binary, deleted, or over `max_file_size`."
+            )
+            set_winbar(session, entry, "")
+        end
+        if M.review_open(session) then
+            session.review_blocks = {}
+            markdown.apply(session.review_buf, { "", "  no diff to review" }, {
+                { line = 1, col = 0, end_col = 20, hl = "LgtmExplainMeta" },
+            })
+        end
         return
     end
 
@@ -1020,41 +1268,45 @@ function M.refresh(session, opts)
         vim.api.nvim_win_get_height(session.working_win)
     )
     session.explain_store = session.explain_store or store.load(store_dir(session))
+    session.review_store = session.review_store or store.load_reviews(store_dir(session))
 
     local data = not opts.force and session.explain_store[entry.path] or nil
-    if data then
-        local dir = store_dir(session)
-        -- An explanation is of the file as it was when it was written. Edit the file
-        -- in the working pane and it may no longer describe what is there.
-        local sha = state.content_hash(vim.fs.joinpath(session.root, entry.path))
-        local recorded = store.shas(dir)[entry.path]
-        local stale = false
-        if recorded == nil then
-            store.record_sha(dir, entry.path, sha)
-        elseif sha and recorded ~= sha then
-            stale = true
+    if M.is_open(session) then
+        if data then
+            local dir = store_dir(session)
+            -- An explanation is of the file as it was when it was written. Edit the
+            -- file in the working pane and it may no longer describe what is there.
+            local sha = state.content_hash(vim.fs.joinpath(session.root, entry.path))
+            local recorded = store.shas(dir)[entry.path]
+            local stale = false
+            if recorded == nil then
+                store.record_sha(dir, entry.path, sha)
+            elseif sha and recorded ~= sha then
+                stale = true
+            end
+            set_winbar(session, entry, stale and "stale — :LgtmExplain!" or "")
+        else
+            if opts.force then
+                -- Make the arrival of the replacement observable to the watcher, and
+                -- stop the old text being shown as though it were the new.
+                store.delete_path(store_dir(session), entry.path)
+                session.explain_store[entry.path] = nil
+                store.record_sha(store_dir(session), entry.path, nil)
+            end
+            render_progress(session, entry)
+            ensure_run(session, opts.force and { only = { entry.path } } or nil)
         end
-
-        render(
-            session,
-            ai.map_to_regions(data.explanations, session.explain_regions),
-            vim.api.nvim_win_get_width(session.explain_win)
-        )
-        set_winbar(session, entry, stale and "stale — :LgtmExplain!" or "")
-        M.sync(session)
-        return
     end
 
-    if opts.force then
-        -- Make the arrival of the replacement observable to the watcher, and stop
-        -- the old text being shown as though it were the new.
-        store.delete_path(store_dir(session), entry.path)
-        session.explain_store[entry.path] = nil
-        store.record_sha(store_dir(session), entry.path, nil)
+    -- One canvas pass covers whichever columns have content. The explain
+    -- column is skipped inside when it has no data — the progress text above
+    -- stays on screen; the review canvas keeps every file current, including
+    -- the "no findings yet" emptiness, which renders as blank rows.
+    render_current(session)
+    if M.review_open(session) and review_runs(session) == 0 then
+        set_review_winbar(session, "")
     end
-
-    render_progress(session, entry)
-    ensure_run(session, opts.force and { only = { entry.path } } or nil)
+    M.sync(session)
 end
 
 -- ---------------------------------------------------------------------------
@@ -1069,6 +1321,18 @@ local function target_width(session)
     -- columns.
     local room = vim.o.columns - (cfg.tree_width or 60) - (cfg.base_width or 60) - 40
     return math.max(24, math.min(want, room)), room
+end
+
+--- One directory watcher serves both columns; whichever opens first creates
+--- it. Each Write an agent makes fires it, which is what turns whole runs into
+--- results that arrive a file at a time.
+local function ensure_watch(session)
+    if session.explain_watch then
+        return
+    end
+    session.explain_watch = store.watch(store_dir(session), function()
+        M.reload(session)
+    end)
 end
 
 function M.open(session)
@@ -1135,18 +1399,20 @@ function M.open(session)
     session.explain_win = win
     session.explain_buf = buf
 
-    -- Each Write the agent makes fires this, which is what turns one whole-PR run
-    -- into results that arrive a file at a time.
-    session.explain_watch = store.watch(store_dir(session), function()
-        M.reload(session)
-    end)
+    ensure_watch(session)
     return true
 end
 
+--- Close the explain column. Review runs and the review pane are untouched —
+--- the two columns share machinery, not a lifecycle.
 function M.close(session)
-    stop_run(session)
-    store.unwatch(session.explain_watch)
-    session.explain_watch = nil
+    kill_jobs(session, function(spec)
+        return not (spec and spec.kind == "review")
+    end)
+    if not M.review_open(session) then
+        store.unwatch(session.explain_watch)
+        session.explain_watch = nil
+    end
     clear_padding(session)
     if session.explain_win and vim.api.nvim_win_is_valid(session.explain_win) then
         pcall(vim.api.nvim_win_close, session.explain_win, true)
@@ -1156,8 +1422,224 @@ function M.close(session)
     end
     session.explain_win, session.explain_buf = nil, nil
     session.explain_blocks = nil
-    session.explain_regions = nil
     session.explain_sig, session.explain_layout_width = nil, nil
+    if not M.review_open(session) then
+        session.explain_regions = nil
+    else
+        -- The review column keeps the regions and the canvas; re-place it now
+        -- that the explain column's padding demands are gone.
+        render_current(session)
+        M.sync(session)
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- The review column
+-- ---------------------------------------------------------------------------
+
+--- Redraw the legend: one row per launched role, in that role's colour. The
+--- legend is what makes the colours readable as authorship.
+local function update_legend(session)
+    if not (session.legend_buf and vim.api.nvim_buf_is_valid(session.legend_buf)) then
+        return
+    end
+    local ns = vim.api.nvim_create_namespace("lgtm_legend")
+    local lines = {}
+    local roles = session.review_roles or {}
+    if #roles == 0 then
+        lines = { "  no reviewers yet" }
+    else
+        for _, key in ipairs(roles) do
+            local role = reviewers.get(key)
+            table.insert(lines, "  ● " .. (role and role.title or key))
+        end
+    end
+    vim.bo[session.legend_buf].modifiable = true
+    vim.api.nvim_buf_set_lines(session.legend_buf, 0, -1, false, lines)
+    vim.bo[session.legend_buf].modifiable = false
+    vim.api.nvim_buf_clear_namespace(session.legend_buf, ns, 0, -1)
+    for i, key in ipairs(roles) do
+        pcall(vim.api.nvim_buf_set_extmark, session.legend_buf, ns, i - 1, 0, {
+            end_col = #lines[i],
+            hl_group = reviewers.hl_group(key),
+        })
+    end
+    if session.legend_win and vim.api.nvim_win_is_valid(session.legend_win) then
+        pcall(vim.api.nvim_win_set_height, session.legend_win, math.max(1, #lines))
+    end
+end
+
+--- Open the review column (plus its legend), to the right of the explain
+--- column when that is open, else right of the working pane.
+function M.open_review(session)
+    if M.review_open(session) then
+        return true
+    end
+    local parent = M.is_open(session) and session.explain_win or session.working_win
+    if not (parent and vim.api.nvim_win_is_valid(parent)) then
+        return false
+    end
+
+    local want = (session.cfg.review and session.cfg.review.width) or 56
+    local width = math.max(24, math.min(want, vim.o.columns - 80))
+
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.bo[buf].buftype = "nofile"
+    vim.bo[buf].bufhidden = "hide"
+    vim.bo[buf].swapfile = false
+    pcall(vim.api.nvim_buf_set_name, buf, "lgtm://review")
+    vim.bo[buf].filetype = "lgtm-review"
+
+    local prev = vim.api.nvim_get_current_win()
+    vim.api.nvim_set_current_win(parent)
+    vim.cmd("noautocmd rightbelow vsplit")
+    local win = vim.api.nvim_get_current_win()
+    -- Same discipline as the explain pane: never join the diff group, and no
+    -- soft wrap — the row-for-row alignment depends on it.
+    vim.wo[win].diff = false
+    vim.wo[win].scrollbind = false
+    vim.wo[win].cursorbind = false
+    vim.wo[win].foldmethod = "manual"
+    vim.wo[win].foldcolumn = "0"
+    vim.api.nvim_win_set_buf(win, buf)
+    vim.wo[win].number = false
+    vim.wo[win].relativenumber = false
+    vim.wo[win].signcolumn = "no"
+    vim.wo[win].colorcolumn = ""
+    vim.wo[win].cursorline = false
+    vim.wo[win].winfixwidth = true
+    vim.wo[win].wrap = false
+    vim.api.nvim_win_set_width(win, width)
+
+    -- The legend, at the bottom of the review column.
+    vim.cmd("noautocmd belowright split")
+    local legend_win = vim.api.nvim_get_current_win()
+    local legend_buf = vim.api.nvim_create_buf(false, true)
+    vim.bo[legend_buf].buftype = "nofile"
+    vim.bo[legend_buf].bufhidden = "hide"
+    vim.bo[legend_buf].swapfile = false
+    pcall(vim.api.nvim_buf_set_name, legend_buf, "lgtm://legend")
+    vim.api.nvim_win_set_buf(legend_win, legend_buf)
+    vim.wo[legend_win].number = false
+    vim.wo[legend_win].relativenumber = false
+    vim.wo[legend_win].signcolumn = "no"
+    vim.wo[legend_win].colorcolumn = ""
+    vim.wo[legend_win].cursorline = false
+    vim.wo[legend_win].winfixwidth = true
+    vim.wo[legend_win].winfixheight = true
+    vim.wo[legend_win].wrap = false
+    vim.api.nvim_win_set_height(legend_win, 1)
+
+    vim.api.nvim_set_current_win(prev)
+
+    session.review_win, session.review_buf = win, buf
+    session.legend_win, session.legend_buf = legend_win, legend_buf
+    set_review_winbar(session, "")
+    update_legend(session)
+    ensure_watch(session)
+    return true
+end
+
+--- Ask one role to review the current chapter (or the whole change when no
+--- chapter is selected). Each role is its own run through the same queue as
+--- the explain phases, so several roles review in parallel under
+--- `max_parallel`.
+function M.start_review(session, key)
+    local role = reviewers.get(key)
+    if not role then
+        vim.notify("lgtm: no reviewer called " .. tostring(key), vim.log.levels.WARN)
+        return false
+    end
+    if not M.open_review(session) then
+        return false
+    end
+    session.explain_jobs = session.explain_jobs or {}
+    session.explain_queue = session.explain_queue or {}
+    session.review_store = session.review_store or store.load_reviews(store_dir(session))
+    session.review_roles = session.review_roles or {}
+    if not vim.tbl_contains(session.review_roles, key) then
+        table.insert(session.review_roles, key)
+    end
+    update_legend(session)
+
+    -- Scope: the selected chapter's files, or everything on show.
+    local chapter = session.chapter and session.guide and session.guide.chapters[session.chapter] or nil
+    local by_path = entry_by_path(session)
+    local paths = {}
+    if chapter then
+        for _, p in ipairs(chapter.files or {}) do
+            if by_path[p] then
+                table.insert(paths, p)
+            end
+        end
+    else
+        for _, e in ipairs(session.entries) do
+            table.insert(paths, e.path)
+        end
+    end
+    local todo = {}
+    for _, p in ipairs(paths) do
+        if not ((session.review_store[p] or {})[key]) then
+            table.insert(todo, p)
+        end
+    end
+    if #todo == 0 then
+        vim.notify("lgtm: " .. role.title .. " has already covered these files", vim.log.levels.INFO)
+        return true
+    end
+
+    local spec_key = "review-" .. key .. " " .. (session.chapter and ("chapter " .. session.chapter) or "all")
+    if scheduled(session, spec_key) then
+        vim.notify("lgtm: " .. role.title .. " is already running here", vim.log.levels.INFO)
+        return true
+    end
+    local current = session.entries[session.index]
+    table.insert(session.explain_queue, {
+        key = spec_key,
+        kind = "review",
+        role = role,
+        chapter = chapter,
+        paths = todo,
+        current = (current and vim.tbl_contains(todo, current.path)) and current.path or nil,
+    })
+    pump(session)
+    M.refresh(session)
+    return true
+end
+
+--- Close the review column and its legend, killing only review runs. The
+--- explain column and its runs are untouched.
+function M.close_review(session)
+    kill_jobs(session, function(spec)
+        return spec and spec.kind == "review"
+    end)
+    if not M.is_open(session) then
+        store.unwatch(session.explain_watch)
+        session.explain_watch = nil
+    end
+    for _, w in ipairs({ session.legend_win, session.review_win }) do
+        if w and vim.api.nvim_win_is_valid(w) then
+            pcall(vim.api.nvim_win_close, w, true)
+        end
+    end
+    for _, b in ipairs({ session.legend_buf, session.review_buf }) do
+        if b and vim.api.nvim_buf_is_valid(b) then
+            pcall(vim.api.nvim_buf_delete, b, { force = true })
+        end
+    end
+    session.review_win, session.review_buf = nil, nil
+    session.legend_win, session.legend_buf = nil, nil
+    session.review_blocks = nil
+    session.review_roles = nil
+    if M.is_open(session) then
+        -- Re-place the survivor without the review column's padding demands.
+        render_current(session)
+        M.sync(session)
+    else
+        clear_padding(session)
+        session.explain_regions = nil
+        session.explain_sig = nil
+    end
 end
 
 return M

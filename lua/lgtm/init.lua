@@ -102,6 +102,13 @@ local defaults = {
         -- it are named instead, and the agent fetches them itself.
         max_diff_bytes = 60000,
     },
+    -- The AI review column: specialist reviewer roles (see lua/lgtm/reviewers.lua)
+    -- judging the selected chapter — or the whole change — with their findings
+    -- rendered beside the diff, each role in its own colour, a legend at the
+    -- bottom. Runs share the explain block's cmd/model/tools/max_parallel.
+    review = {
+        width = 56,
+    },
     -- Diff pane colours. Vim paints changed lines edge to edge, so the stock
     -- colours read as bars rather than highlighting; these blend the theme's own
     -- diff hues down to a wash and let DiffText carry the detail. Set to false
@@ -156,6 +163,8 @@ local defaults = {
         prev_chapter_alt = "N",
         toggle_viewed = "<End>",
         toggle_explain = "<leader>ge",
+        -- The reviewer checklist: pick one or many roles to run in parallel.
+        review = "<leader>gw",
         -- Not "m", which is next-file everywhere now.
         tree_toggle_viewed = "v",
         tree_open = "<CR>",
@@ -565,6 +574,113 @@ end
 
 M._toggle_explain = toggle_explain
 
+--- Launch a set of reviewer roles over the selected chapter (or everything).
+local function start_reviews(keys_list)
+    if not session_valid() then
+        return
+    end
+    for _, key in ipairs(keys_list) do
+        explain.start_review(session, key)
+    end
+    -- The pane exists after the first start; give it the session's maps.
+    if session.review_buf and vim.api.nvim_buf_is_valid(session.review_buf) then
+        apply_keys(session.review_buf, false)
+    end
+end
+
+--- The reviewer checklist: a small float over the roles, one OR many.
+--- <Space> ticks, `a` ticks everything, <CR> launches the ticked roles in
+--- parallel, q or <Esc> cancels.
+local function review_checklist()
+    if not session_valid() then
+        return
+    end
+    local roles = require("lgtm.reviewers").roles
+    local reviewers_mod = require("lgtm.reviewers")
+    local ticked = {}
+
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.bo[buf].buftype = "nofile"
+    vim.bo[buf].bufhidden = "wipe"
+    local ns = vim.api.nvim_create_namespace("lgtm_review_checklist")
+
+    local width = 34
+    local scope = session.chapter
+            and session.guide
+            and session.guide.chapters[session.chapter]
+            and session.guide.chapters[session.chapter].title
+        or "all files"
+    local win = vim.api.nvim_open_win(buf, true, {
+        relative = "editor",
+        style = "minimal",
+        border = "rounded",
+        title = " reviewers — " .. scope:sub(1, 20) .. " ",
+        width = width,
+        height = #roles,
+        col = math.floor((vim.o.columns - width) / 2),
+        row = math.floor((vim.o.lines - #roles) / 2) - 1,
+    })
+    vim.wo[win].cursorline = true
+
+    local function draw()
+        local lines = {}
+        for i, r in ipairs(roles) do
+            lines[i] = string.format(" %s %s", ticked[i] and "▣" or "☐", r.title)
+        end
+        vim.bo[buf].modifiable = true
+        vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+        vim.bo[buf].modifiable = false
+        vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+        for i, r in ipairs(roles) do
+            pcall(vim.api.nvim_buf_set_extmark, buf, ns, i - 1, 0, {
+                end_col = #lines[i],
+                hl_group = reviewers_mod.hl_group(r.key),
+            })
+        end
+    end
+    draw()
+
+    local function bufmap(lhs, fn)
+        vim.keymap.set("n", lhs, fn, { buffer = buf, nowait = true, silent = true })
+    end
+    local function close()
+        if vim.api.nvim_win_is_valid(win) then
+            vim.api.nvim_win_close(win, true)
+        end
+    end
+    bufmap("<Space>", function()
+        local i = vim.api.nvim_win_get_cursor(win)[1]
+        ticked[i] = not ticked[i] or nil
+        draw()
+    end)
+    bufmap("a", function()
+        for i = 1, #roles do
+            ticked[i] = true
+        end
+        draw()
+    end)
+    bufmap("<CR>", function()
+        local chosen = {}
+        for i, r in ipairs(roles) do
+            if ticked[i] then
+                table.insert(chosen, r.key)
+            end
+        end
+        -- <CR> with nothing ticked launches the role under the cursor: the
+        -- one-role case should not cost a <Space> first.
+        if #chosen == 0 then
+            local i = vim.api.nvim_win_get_cursor(win)[1]
+            chosen = { roles[i] and roles[i].key or nil }
+        end
+        close()
+        start_reviews(chosen)
+    end)
+    bufmap("q", close)
+    bufmap("<Esc>", close)
+end
+
+M._review_checklist = review_checklist
+
 local function tree_cursor_item()
     if not session_valid() then
         return nil
@@ -630,6 +746,7 @@ local function close_session(force)
     -- Before layout.close: a float left open when its parent tab goes can strand
     -- the window or block the tabclose.
     ruler.close(session)
+    explain.close_review(session)
     explain.close(session)
     close_chapter_picker()
     layout.close(session)
@@ -657,6 +774,7 @@ function apply_keys(buf, is_tree)
     map(buf, k.prev_chapter_alt, function() step_chapter(-1) end, "previous chapter")
     map(buf, k.toggle_viewed, toggle_viewed, "toggle viewed")
     map(buf, k.toggle_explain, function() toggle_explain(false) end, "toggle the explanation column")
+    map(buf, k.review, review_checklist, "pick AI reviewers")
     map(buf, k.close, function() close_session(false) end, "close session")
     if is_tree then
         map(buf, k.tree_open, tree_open, "open file / fold directory")
@@ -975,6 +1093,40 @@ function M.setup(opts)
     vim.api.nvim_create_user_command("LgtmPick", function()
         require("lgtm.picker").open({ base_branch = M.config.base_branch })
     end, { desc = "Pick a branch to review" })
+
+    vim.api.nvim_create_user_command("LgtmReview", function(args)
+        if not session then
+            vim.notify("lgtm: no session open", vim.log.levels.WARN)
+            return
+        end
+        local keys_list = vim.split(args.args or "", "%s+", { trimempty = true })
+        if #keys_list == 0 then
+            review_checklist()
+        else
+            start_reviews(keys_list)
+        end
+    end, {
+        nargs = "*",
+        desc = "Run AI reviewers over the selected chapter (no argument opens the checklist)",
+        complete = function(lead)
+            local out = {}
+            for _, r in ipairs(require("lgtm.reviewers").roles) do
+                if r.key:find(lead, 1, true) == 1 then
+                    table.insert(out, r.key)
+                end
+            end
+            return out
+        end,
+    })
+
+    vim.api.nvim_create_user_command("LgtmReviewClose", function()
+        if not session then
+            vim.notify("lgtm: no session open", vim.log.levels.WARN)
+            return
+        end
+        explain.close_review(session)
+        ruler.update(session)
+    end, { desc = "Close the AI review column" })
 
     vim.api.nvim_create_user_command("LgtmPr", function(args)
         require("lgtm.picker").open_pr(args.args ~= "" and args.args or nil)
