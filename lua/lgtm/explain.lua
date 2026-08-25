@@ -922,7 +922,10 @@ local function set_review_winbar(session, note)
         return
     end
     vim.wo[session.review_win].winbar = table.concat({
-        "%#LgtmWinbarAIIcon# 󰙴 ",
+        -- A magnifying glass rather than the sparkle — a reviewer looks
+        -- closely — in the ramp's lilac, the same colour as the R beside it.
+        -- U+F002 as byte escapes; private-use glyphs do not survive every tool.
+        "%#LgtmWinbarReviewIcon# \239\128\130 ",
         -- The review ramp: lilac into teal, against the magenta wash of the
         -- other AI headers.
         require("lgtm.layout").ai_label("REVIEW", "review"),

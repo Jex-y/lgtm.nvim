@@ -234,6 +234,9 @@ function M.setup_winbar_highlights()
         vim.api.nvim_set_hl(0, "LgtmWinbarReview" .. i, { fg = fg, bold = true })
     end
     vim.api.nvim_set_hl(0, "LgtmWinbarAIIcon", { fg = RAMPS.ai[1], bold = true })
+    -- The review column's own icon colour: the first shade of its ramp, so the
+    -- icon and the R it sits beside are one colour.
+    vim.api.nvim_set_hl(0, "LgtmWinbarReviewIcon", { fg = RAMPS.review[1], bold = true })
 end
 
 --- Show one file's before/after pair.
