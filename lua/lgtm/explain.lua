@@ -1014,7 +1014,11 @@ function launch(session, spec)
         end
     end
 
-    session.explain_started = session.explain_started or vim.uv.now()
+    -- The clock measures the current batch, not the session: reset it whenever
+    -- a run starts from idle, keep it while other runs are already in flight.
+    if running(session) == 0 or not session.explain_started then
+        session.explain_started = vim.uv.now()
+    end
     local job = ai.run(prompt, contract, { repo = session.root, out = dir }, cfg, function(ok, err)
         if session.explain_jobs then
             session.explain_jobs[spec.key] = nil
@@ -1041,6 +1045,8 @@ function launch(session, spec)
         end
         if running(session) == 0 and #(session.explain_queue or {}) == 0 then
             stop_timer(session)
+            -- Everything drained: the next batch starts its own clock.
+            session.explain_started = nil
         end
     end)
 
