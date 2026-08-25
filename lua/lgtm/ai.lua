@@ -468,10 +468,17 @@ end
 
 --- Start one run. Calls back on the main loop with (ok, err) when the process
 --- ends; the results themselves arrive as files, not through here.
+---
+--- Output is stream-json rather than json: `-p` with plain json prints
+--- nothing until exit, and the stream's per-turn usage records are the only
+--- live signal a run gives off. `on_usage`, when given, receives the running
+--- output-token total — parsed defensively, since the event shapes are the
+--- CLI's to change.
 --- @param contract string the system-prompt contract for this run's phase
 --- @param paths table { repo = <cwd>, out = <output dir> }
 --- @param cfg table the `explain` config block
-function M.run(prompt, contract, paths, cfg, cb)
+--- @param on_usage function|nil called with the cumulative output tokens
+function M.run(prompt, contract, paths, cfg, cb, on_usage)
     if vim.fn.executable(cfg.cmd[1]) ~= 1 then
         vim.schedule(function()
             cb(false, cfg.cmd[1] .. " is not on $PATH")
@@ -495,7 +502,9 @@ function M.run(prompt, contract, paths, cfg, cb)
     vim.list_extend(args, {
         "-p",
         "--output-format",
-        "json",
+        "stream-json",
+        -- stream-json in -p mode is refused without it.
+        "--verbose",
         "--no-session-persistence",
         "--permission-mode",
         "dontAsk",
@@ -516,12 +525,49 @@ function M.run(prompt, contract, paths, cfg, cb)
     end
     vim.list_extend(args, cfg.extra_args or {})
 
+    -- Tokens, tallied off the stream. Each assistant turn carries its own
+    -- usage; the final result record carries the authoritative total when the
+    -- CLI provides one.
+    local carry, total = "", 0
+    local function on_stdout(_, chunk)
+        if not (chunk and on_usage) then
+            return
+        end
+        carry = carry .. chunk
+        while true do
+            local nl = carry:find("\n", 1, true)
+            if not nl then
+                break
+            end
+            local line = carry:sub(1, nl - 1)
+            carry = carry:sub(nl + 1)
+            local ok, obj = pcall(vim.json.decode, line)
+            if ok and type(obj) == "table" then
+                local usage = (type(obj.usage) == "table" and obj.usage)
+                    or (type(obj.message) == "table" and type(obj.message.usage) == "table" and obj.message.usage)
+                local out = usage and tonumber(usage.output_tokens) or nil
+                if out then
+                    if obj.type == "result" then
+                        total = math.max(total, out)
+                    else
+                        total = total + out
+                    end
+                    local snapshot = total
+                    vim.schedule(function()
+                        on_usage(snapshot)
+                    end)
+                end
+            end
+        end
+    end
+
     -- Stdin, not argv: a prompt with a PR body and pasted diffs in it is well
     -- past what an argument can carry.
     return vim.system(args, {
         cwd = paths.repo,
         text = true,
         stdin = prompt,
+        stdout = on_usage and on_stdout or true,
         timeout = cfg.timeout,
     }, function(res)
         vim.schedule(function()

@@ -831,7 +831,7 @@ end
 -- chapters overlap in time instead of queueing behind one another.
 -- ---------------------------------------------------------------------------
 
-local schedule_runs, pump, launch
+local schedule_runs, pump, launch, update_legend
 
 local function stop_timer(session)
     if session.explain_timer then
@@ -1019,7 +1019,21 @@ function launch(session, spec)
     if running(session) == 0 or not session.explain_started then
         session.explain_started = vim.uv.now()
     end
+    -- The live token feed: ai.run schedules these onto the main loop.
+    local tokens_seen = 0
+    local on_usage = function(total)
+        tokens_seen = total
+        local run = (session.explain_jobs or {})[spec.key]
+        if run then
+            run.tokens = total
+        end
+    end
     local job = ai.run(prompt, contract, { repo = session.root, out = dir }, cfg, function(ok, err)
+        -- Bank this run's tokens against its role before the job entry goes.
+        if spec.kind == "review" and spec.role then
+            session.review_tokens = session.review_tokens or {}
+            session.review_tokens[spec.role.key] = (session.review_tokens[spec.role.key] or 0) + tokens_seen
+        end
         if session.explain_jobs then
             session.explain_jobs[spec.key] = nil
         end
@@ -1031,6 +1045,10 @@ function launch(session, spec)
         M.reload(session)
         if not ok then
             vim.notify(string.format("lgtm: the %s run ended early (%s)", spec.key, err), vim.log.levels.WARN)
+            if spec.kind == "review" and spec.role then
+                session.review_failed = session.review_failed or {}
+                session.review_failed[spec.role.key] = true
+            end
         end
         -- The guide unlocking the chapters is normally caught by the directory
         -- watcher the moment guide.json lands; this is the backstop.
@@ -1038,17 +1056,20 @@ function launch(session, spec)
             schedule_runs(session)
         end
         pump(session)
-        if M.review_open(session) and review_runs(session) == 0 then
-            -- Repaint the idle note — "N findings" or "no findings" — so a
-            -- silent review is distinguishable from one still running.
-            M.refresh(session)
+        if M.review_open(session) then
+            update_legend(session)
+            if review_runs(session) == 0 then
+                -- Repaint the idle note — "N findings" or "no findings" — so a
+                -- silent review is distinguishable from one still running.
+                M.refresh(session)
+            end
         end
         if running(session) == 0 and #(session.explain_queue or {}) == 0 then
             stop_timer(session)
             -- Everything drained: the next batch starts its own clock.
             session.explain_started = nil
         end
-    end)
+    end, on_usage)
 
     if job then
         -- The spec rides along so the scheduler can see which paths are already
@@ -1077,6 +1098,8 @@ function launch(session, spec)
                     session,
                     string.format("%d reviewer%s · %ds", active, active == 1 and "" or "s", secs)
                 )
+                -- The legend rows carry per-role status, seconds included.
+                update_legend(session)
             end
         end))
     end
@@ -1497,21 +1520,76 @@ end
 -- The review column
 -- ---------------------------------------------------------------------------
 
---- Redraw the legend: one row per launched role, in that role's colour. The
---- legend is what makes the colours readable as authorship.
-local function update_legend(session)
+local function fmt_tokens(n)
+    if n >= 1000 then
+        return string.format("%.1fk tok", n / 1000)
+    end
+    return n .. " tok"
+end
+
+--- One role's place in the machinery, as a short status for its legend row:
+--- queued, running (seconds and live tokens), failed, or its finding count
+--- with what it cost.
+local function role_status(session, key)
+    for _, run in pairs(session.explain_jobs or {}) do
+        if run.spec and run.spec.kind == "review" and run.spec.role and run.spec.role.key == key then
+            local secs = session.explain_started and math.floor((vim.uv.now() - session.explain_started) / 1000)
+                or 0
+            local note = string.format("running · %ds", secs)
+            if (run.tokens or 0) > 0 then
+                note = note .. " · " .. fmt_tokens(run.tokens)
+            end
+            return note, "Comment"
+        end
+    end
+    for _, s in ipairs(session.explain_queue or {}) do
+        if s.kind == "review" and s.role and s.role.key == key then
+            return "queued", "Comment"
+        end
+    end
+    if (session.review_failed or {})[key] then
+        return "failed", "WarningMsg"
+    end
+    local n = 0
+    for _, by_role in pairs(session.review_store or {}) do
+        local comments = by_role[key]
+        if comments then
+            n = n + #comments
+        end
+    end
+    local note = n == 0 and "no findings" or string.format("%d finding%s", n, n == 1 and "" or "s")
+    local spent = (session.review_tokens or {})[key] or 0
+    if spent > 0 then
+        note = note .. " · " .. fmt_tokens(spent)
+    end
+    return note, "Comment"
+end
+
+--- Redraw the legend: one row per launched role, dot and name in the role's
+--- colour, its live status alongside. The legend is both the colour key and
+--- the panel's progress board.
+function update_legend(session)
     if not (session.legend_buf and vim.api.nvim_buf_is_valid(session.legend_buf)) then
         return
     end
     local ns = vim.api.nvim_create_namespace("lgtm_legend")
-    local lines = {}
     local roles = session.review_roles or {}
+    local lines, statuses = {}, {}
     if #roles == 0 then
         lines = { "  no reviewers yet" }
     else
+        local widest = 0
         for _, key in ipairs(roles) do
             local role = reviewers.get(key)
-            table.insert(lines, "  ● " .. (role and role.title or key))
+            widest = math.max(widest, #(role and role.title or key))
+        end
+        for _, key in ipairs(roles) do
+            local role = reviewers.get(key)
+            local title = role and role.title or key
+            local status, status_hl = role_status(session, key)
+            local name = "  ● " .. title .. string.rep(" ", widest - #title)
+            table.insert(lines, name .. "  " .. status)
+            table.insert(statuses, { name_end = #name, status_hl = status_hl })
         end
     end
     vim.bo[session.legend_buf].modifiable = true
@@ -1520,8 +1598,12 @@ local function update_legend(session)
     vim.api.nvim_buf_clear_namespace(session.legend_buf, ns, 0, -1)
     for i, key in ipairs(roles) do
         pcall(vim.api.nvim_buf_set_extmark, session.legend_buf, ns, i - 1, 0, {
-            end_col = #lines[i],
+            end_col = statuses[i].name_end,
             hl_group = reviewers.hl_group(key),
+        })
+        pcall(vim.api.nvim_buf_set_extmark, session.legend_buf, ns, i - 1, statuses[i].name_end, {
+            end_col = #lines[i],
+            hl_group = statuses[i].status_hl,
         })
     end
     if session.legend_win and vim.api.nvim_win_is_valid(session.legend_win) then
