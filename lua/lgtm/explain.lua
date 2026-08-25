@@ -1034,8 +1034,10 @@ function launch(session, spec)
             schedule_runs(session)
         end
         pump(session)
-        if review_runs(session) == 0 then
-            set_review_winbar(session, "")
+        if M.review_open(session) and review_runs(session) == 0 then
+            -- Repaint the idle note — "N findings" or "no findings" — so a
+            -- silent review is distinguishable from one still running.
+            M.refresh(session)
         end
         if running(session) == 0 and #(session.explain_queue or {}) == 0 then
             stop_timer(session)
@@ -1343,10 +1345,20 @@ function M.refresh(session, opts)
     -- One canvas pass covers whichever columns have content. The explain
     -- column is skipped inside when it has no data — the progress text above
     -- stays on screen; the review canvas keeps every file current, including
-    -- the "no findings yet" emptiness, which renders as blank rows.
+    -- the "no findings" emptiness, which renders as blank rows.
     render_current(session)
     if M.review_open(session) and review_runs(session) == 0 then
-        set_review_winbar(session, "")
+        -- A finished review with nothing to say looks exactly like one that
+        -- has not landed yet — both are a blank pane — so the winbar says
+        -- which it is.
+        local count = 0
+        for _, comments in pairs((session.review_store or {})[entry.path] or {}) do
+            count = count + #comments
+        end
+        set_review_winbar(
+            session,
+            count > 0 and string.format("%d finding%s", count, count == 1 and "" or "s") or "no findings"
+        )
     end
     M.sync(session)
 end
