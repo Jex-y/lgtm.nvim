@@ -182,19 +182,22 @@ the bottom of the column is the key:
 ```
 │ 󰙴 REVIEW                        │
 │  ▌ 120–134                      │
-│  ● review-security — SQL built  │
-│    by string concatenation      │
+│   SQL built by string        │
+│    concatenation                │
 │    `build_query` interpolates…  │
 │                                 │
-│  ● review-tests — no test for   │
-│    the new fallback branch      │
+│   no test for the new        │
+│    fallback branch              │
 ├─────────────────────────────────┤
 │  ● review-security              │
 │  ● review-tests                 │
 └─────────────────────────────────┘
 ```
 
-A reviewer with nothing to say writes nothing — silent regions stay blank, and
+Comments carry no role prefix — the colour is the byline, and the legend is
+the key. Each finding leads with a severity icon in the theme's diagnostic
+colours:  risk (can break production),  warn (should be fixed),
+ info (the author may decline). A reviewer with nothing to say writes nothing — silent regions stay blank, and
 an empty review is a valid review. Findings are cached with the explanations,
 per branch. The review column has its own lifecycle: it stays up when
 `<leader>ge` closes the comments column, and closes with `:LgtmReviewClose` or

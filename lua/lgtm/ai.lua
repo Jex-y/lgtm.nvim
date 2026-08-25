@@ -171,11 +171,15 @@ Each contains exactly this, and nothing else:
 
 {"path":"<the file's path, exactly as given to you>",
  "role":"<your role key, exactly as given>",
- "comments":[{"start":120,"end":134,"title":"...","body":"..."}]}
+ "comments":[{"start":120,"end":134,"severity":"warn","title":"...","body":"..."}]}
 
   * "start" and "end" are line numbers in the NEW version of that file — the
     right-hand side of the diff. For a finding about deleted lines, use the new
     line number they sat after, for both.
+  * "severity" is one of exactly three values. "risk": this can break
+    correctness, security or data in production. "warn": this should be fixed —
+    a robustness, quality or maintainability defect. "info": an observation or
+    a suggestion the author may reasonably decline.
   * "title" is one line, at most 60 characters, no trailing full stop: the
     finding, not its category.
   * "body" is 1-4 sentences of markdown: the finding, the evidence, and — where
@@ -452,6 +456,8 @@ function M.map_to_regions(explanations, regions, slack)
             table.insert(out[i], {
                 title = type(e.title) == "string" and vim.trim(e.title) or "",
                 body = type(e.body) == "string" and vim.trim(e.body) or "",
+                -- Carried through for review findings; explanations have none.
+                severity = type(e.severity) == "string" and e.severity or nil,
                 group = groups[j],
                 lead = groups[j][1] == i,
             })

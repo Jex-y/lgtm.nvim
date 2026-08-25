@@ -424,13 +424,42 @@ end
 --- Where a block is taller than the rows between its region and the next, it reports
 --- the shortfall rather than overlapping: the caller pads the code panes to open the
 --- gap and lays out again. That is the only reason padding exists.
+-- Severity icons for review findings, in the theme's own diagnostic colours.
+-- The role's colour carries WHO said it (the legend is the key); the icon
+-- carries HOW MUCH it matters.
+-- Byte escapes rather than literal glyphs: nerd-font codepoints sit in the
+-- private-use area and do not survive every editor and diff tool. U+F057 is
+-- the circled cross, U+F071 the warning triangle, U+F05A the info circle.
+local SEVERITIES = {
+    risk = { icon = "\239\129\151", hl = "DiagnosticError" },
+    warn = { icon = "\239\129\177", hl = "DiagnosticWarn" },
+    info = { icon = "\239\129\154", hl = "DiagnosticInfo" },
+}
+local SEVERITY_ALIAS = {
+    error = "risk",
+    critical = "risk",
+    high = "risk",
+    warning = "warn",
+    medium = "warn",
+    low = "info",
+    note = "info",
+    hint = "info",
+    suggestion = "info",
+}
+
+local function severity_of(item)
+    local s = type(item.severity) == "string" and item.severity:lower() or "info"
+    return SEVERITIES[s] or SEVERITIES[SEVERITY_ALIAS[s] or "info"]
+end
+
 --- One block per region for the review column. Unlike the explain column, a
 --- region nobody found fault with renders nothing at all: a silent reviewer
---- should not fill the pane with dots. Each finding is one heading line —
---- `● <role> — <title>` — and its body, the whole comment tinted in the
---- role's colour, with markdown's inline marks layered after the tint so code
---- chips still read as chips.
---- @param by_region table region index -> list of { role, title, body, group, lead }
+--- should not fill the pane with dots. Each finding is a severity icon plus
+--- its title, then its body — no role prefix, because the role's colour IS
+--- the byline — with markdown's inline marks layered after the role tint so
+--- code chips still read as chips.
+--- @param by_region table region index -> list of { role, severity, title,
+---        body, group, lead }
 local function build_review_blocks(session, by_region, width)
     local text_width = math.max(20, width - 4)
     local blocks = {}
@@ -448,17 +477,25 @@ local function build_review_blocks(session, by_region, width)
                 local group = reviewers.hl_group(e.role.key)
                 if not e.lead then
                     local lead = session.explain_regions[e.group[1]]
-                    local l = "    ↑ "
-                        .. e.role.title
-                        .. ": one finding with "
-                        .. span_label(lead.first, lead.last, lead.added)
+                    local l = "    ↑ one finding with " .. span_label(lead.first, lead.last, lead.added)
                     table.insert(lines, l)
-                    table.insert(marks, { line = #lines - 1, col = 0, end_col = #l, hl = "LgtmExplainMeta" })
+                    -- Role colour, not the meta grey: the pointer still needs
+                    -- its byline.
+                    table.insert(marks, { line = #lines - 1, col = 0, end_col = #l, hl = group })
                 else
-                    local heading = "● " .. e.role.title .. (e.title ~= "" and (" — " .. e.title) or "")
-                    for _, l in ipairs(markdown.wrap(heading, text_width, "  ")) do
+                    local sev = severity_of(e)
+                    local heading = sev.icon .. " " .. (e.title ~= "" and e.title or "(untitled finding)")
+                    for li, l in ipairs(markdown.wrap(heading, text_width, "  ")) do
                         table.insert(lines, l)
-                        table.insert(marks, { line = #lines - 1, col = 0, end_col = #l, hl = group })
+                        local row = #lines - 1
+                        if li == 1 then
+                            -- The icon in its severity colour, the title in the
+                            -- role's. The wrap indents by two spaces.
+                            table.insert(marks, { line = row, col = 2, end_col = 2 + #sev.icon, hl = sev.hl })
+                            table.insert(marks, { line = row, col = 2 + #sev.icon, end_col = #l, hl = group })
+                        else
+                            table.insert(marks, { line = row, col = 0, end_col = #l, hl = group })
+                        end
                     end
                     local indented = {}
                     for _, bl in ipairs(vim.split(e.body, "\n", { plain = true })) do
