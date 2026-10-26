@@ -16,6 +16,9 @@ local ICONS = {
     unviewed = " ",
     open = "▾",
     closed = "▸",
+    -- One per reviewer role with findings on the file, in the role's colour —
+    -- the same colour its comments and its legend row wear.
+    dot = "●",
 }
 
 --- Assemble a nested directory structure from a flat list of file entries.
@@ -182,7 +185,10 @@ end
 
 --- Render the tree into `buf`, returning the line -> entry map used for
 --- navigation and cursor tracking.
---- @param opts table { entries, store, current_path, folded, header }
+--- @param opts table { entries, store, current_path, folded, header, width,
+---        reviews } — `reviews` is path -> role key -> comments, as
+---        store.load_reviews returns it; a file with findings gets a dot per
+---        role after its name.
 function M.render(buf, opts)
     local entries, store = opts.entries, opts.store
     local folded = opts.folded or {}
@@ -313,12 +319,37 @@ function M.render(buf, opts)
         -- matters.
         local counts = "  " .. add_field .. " " .. del_field
 
+        -- Reviewer dots: one per role with findings here, walked in the roles'
+        -- fixed order so two files with the same reviewers read the same way.
+        local dots, dot_hls = "", {}
+        local by_role = opts.reviews and opts.reviews[e.path] or nil
+        if by_role then
+            local reviewers = require("lgtm.reviewers")
+            for _, role in ipairs(reviewers.roles) do
+                local comments = by_role[role.key]
+                if comments and #comments > 0 then
+                    table.insert(dot_hls, { at = #dots, hl = reviewers.hl_group(role.key) })
+                    dots = dots .. ICONS.dot
+                end
+            end
+            if dots ~= "" then
+                dots = " " .. dots
+                for _, d in ipairs(dot_hls) do
+                    d.at = d.at + 1
+                end
+            end
+        end
+
         -- Deep nesting plus long filenames overruns a narrow panel, and the
         -- overrun falls on the right — exactly where the counts live. Keep the
         -- counts pinned to the right edge and shorten the name instead, eliding
         -- the middle so both the leading words and the extension survive.
         local width = opts.width or 40
-        local room = width - vim.fn.strdisplaywidth(prefix) - vim.fn.strdisplaywidth(counts) - 1
+        local room = width
+            - vim.fn.strdisplaywidth(prefix)
+            - vim.fn.strdisplaywidth(counts)
+            - vim.fn.strdisplaywidth(dots)
+            - 1
         if room >= 8 and vim.fn.strdisplaywidth(name) > room then
             -- Keep the extension and spend everything else on the head. Sibling
             -- files in a codebase share their tails far more often than their
@@ -331,8 +362,8 @@ function M.render(buf, opts)
             name = name:sub(1, math.max(1, room - #ext - 1)) .. "…" .. ext
         end
 
-        local pad = math.max(0, width - vim.fn.strdisplaywidth(prefix .. name .. counts))
-        local text = prefix .. name .. string.rep(" ", pad) .. counts
+        local pad = math.max(0, width - vim.fn.strdisplaywidth(prefix .. name .. dots .. counts))
+        local text = prefix .. name .. dots .. string.rep(" ", pad) .. counts
         table.insert(lines, text)
         local idx = #lines - 1
         line_map[#lines] = { kind = "file", entry = e }
@@ -358,10 +389,15 @@ function M.render(buf, opts)
             hl = is_current and "LgtmCurrentName" or (is_viewed and "LgtmViewed" or "Normal"),
         })
 
+        for _, d in ipairs(dot_hls) do
+            local dcol0 = ncol + #name + d.at
+            table.insert(marks, { line = idx, col = dcol0, end_col = dcol0 + #ICONS.dot, hl = d.hl })
+        end
+
         -- Counts, coloured independently. These use foreground-only groups:
         -- DiffAdd/DiffDelete carry backgrounds in most colourschemes and would
         -- render here as solid blocks rather than as coloured numbers.
-        local ccol = ncol + #name + pad
+        local ccol = ncol + #name + #dots + pad
         local acol = ccol + 2
         local dcol = acol + #add_field + 1
         if e.no_counts then

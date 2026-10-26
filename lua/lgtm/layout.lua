@@ -435,6 +435,8 @@ local function map_line(hunks, lnum, forward)
     return math.max(1, lnum + offset)
 end
 
+M.map_line = map_line
+
 --- Realign the panes after one of them scrolled without 'scrollbind' having run,
 --- which is what happens when the mouse wheel turns over an unfocused window.
 ---

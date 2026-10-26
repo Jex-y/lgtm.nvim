@@ -5,6 +5,7 @@
 -- Opens a tab with three panes: a tree of every changed file, the file as it
 -- exists on the PR's target branch, and the live editable working-tree file.
 
+local ask = require("lgtm.ask")
 local explain = require("lgtm.explain")
 local git = require("lgtm.git")
 local layout = require("lgtm.layout")
@@ -31,7 +32,9 @@ local defaults = {
     -- per-window statuslines the description/tree split draws a status bar
     -- across the middle of the layout. Restored when the session closes.
     global_statusline = true,
-    include_untracked = true,
+    -- Files git does not know about yet. Off: the review is the branch's diff,
+    -- and scratch files in the working tree stay out of it.
+    include_untracked = false,
     -- Where <End> goes after ticking a file: the next file, the next file you
     -- have not yet reviewed, or nowhere.
     advance = "next", -- "next" | "next_unviewed" | "none"
@@ -109,6 +112,17 @@ local defaults = {
     review = {
         width = 56,
     },
+    -- Asking about a hunk: select lines (or stand on a hunk) and type a
+    -- question. The agent gets the PR, the file's diff, the selected lines,
+    -- the explanation for that change and any review findings on it, and
+    -- answers in a float; a follow-up from the float resumes the same session.
+    -- Runs share the explain block's cmd/tools/timeout.
+    ask = {
+        -- nil uses explain.model; a question can deserve a stronger model
+        -- than a batch explanation.
+        model = nil,
+        width = 100,
+    },
     -- Diff pane colours. Vim paints changed lines edge to edge, so the stock
     -- colours read as bars rather than highlighting; these blend the theme's own
     -- diff hues down to a wash and let DiffText carry the detail. Set to false
@@ -165,6 +179,9 @@ local defaults = {
         toggle_explain = "<leader>ge",
         -- The reviewer checklist: pick one or many roles to run in parallel.
         review = "<leader>gw",
+        -- Ask about the hunk under the cursor, or the visually selected lines.
+        -- Inside the answer float the same key asks a follow-up.
+        ask = "<leader>ga",
         -- Not "m", which is next-file everywhere now.
         tree_toggle_viewed = "v",
         tree_open = "<CR>",
@@ -365,6 +382,8 @@ local function redraw_tree()
         folded = session.folded,
         header = session.base_ref,
         width = session.cfg.tree_width,
+        -- A dot per reviewer role with findings on the file.
+        reviews = session.review_store,
     })
     -- Park the tree cursor on the current file so the highlight and the cursor
     -- agree with each other.
@@ -745,6 +764,7 @@ local function close_session(force)
     session.store:save(session.merge_base)
     -- Before layout.close: a float left open when its parent tab goes can strand
     -- the window or block the tabclose.
+    ask.close(session)
     ruler.close(session)
     explain.close_review(session)
     explain.close(session)
@@ -775,6 +795,17 @@ function apply_keys(buf, is_tree)
     map(buf, k.toggle_viewed, toggle_viewed, "toggle viewed")
     map(buf, k.toggle_explain, function() toggle_explain(false) end, "toggle the explanation column")
     map(buf, k.review, review_checklist, "pick AI reviewers")
+    map(buf, k.ask, function() ask.ask(session) end, "ask about this hunk")
+    if k.ask and k.ask ~= "" then
+        -- Visual mode: the selected lines are the subject.
+        vim.keymap.set("x", k.ask, function()
+            local first = vim.fn.line("v")
+            local last = vim.fn.line(".")
+            local win = vim.api.nvim_get_current_win()
+            vim.cmd([[execute "normal! \<Esc>"]])
+            ask.ask(session, { first = math.min(first, last), last = math.max(first, last), win = win })
+        end, { buffer = buf, nowait = true, silent = true, desc = "lgtm: ask about these lines" })
+    end
     map(buf, k.close, function() close_session(false) end, "close session")
     if is_tree then
         map(buf, k.tree_open, tree_open, "open file / fold directory")
@@ -843,6 +874,7 @@ function M.open(base_arg, opts)
     ruler.setup_highlights(cfg.diff_colors)
     markdown.setup_highlights(cfg.diff_colors)
     explain.setup_highlights(cfg.diff_colors)
+    ask.setup_highlights()
     local wins = layout.create(cfg)
 
     -- Tab-local, so a session opened in another worktree gets that directory
@@ -866,6 +898,15 @@ function M.open(base_arg, opts)
         index = 1,
         folded = {},
     })
+
+    -- Findings cached by an earlier session dot the tree from the start;
+    -- new ones redraw it as they land.
+    explain.ensure_loaded(session)
+    session.on_reviews = function()
+        if session_valid() then
+            redraw_tree()
+        end
+    end
 
     -- A guide cached by an earlier run puts the chapter picker up immediately;
     -- otherwise it appears when the explanation run writes one.
@@ -1127,6 +1168,22 @@ function M.setup(opts)
         explain.close_review(session)
         ruler.update(session)
     end, { desc = "Close the AI review column" })
+
+    vim.api.nvim_create_user_command("LgtmAsk", function(args)
+        if not session then
+            vim.notify("lgtm: no session open", vim.log.levels.WARN)
+            return
+        end
+        local opts = { question = args.args ~= "" and args.args or nil }
+        if args.range and args.range > 0 then
+            opts.first, opts.last = args.line1, args.line2
+        end
+        ask.ask(session, opts)
+    end, {
+        nargs = "?",
+        range = true,
+        desc = "Ask the AI about the hunk under the cursor or the given range",
+    })
 
     vim.api.nvim_create_user_command("LgtmPr", function(args)
         require("lgtm.picker").open_pr(args.args ~= "" and args.args or nil)

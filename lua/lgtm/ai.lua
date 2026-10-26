@@ -196,6 +196,33 @@ Rules about the run itself:
   * You cannot write anywhere except the output directory, by design.
 ]]
 
+-- On demand: the reviewer asks a question about one part of the diff. The one
+-- run whose output IS prose — it comes back on stdout, not as files — and the
+-- one that keeps a session, so a follow-up lands in the same conversation.
+local ASK_CONTRACT = [[
+You are answering a reviewer's question about one part of a pull request. The
+reviewer is reading the diff in their editor and has selected some lines of one
+file; the request carries the pull request, the file's diff, the selected lines,
+the explanation an earlier agent wrote for that change, and any findings the
+review panel raised on it. Answer the question they ask, using all of that.
+
+WHAT IS UNDER REVIEW is the cumulative difference between the base branch's
+merge base and the working tree — the same thing GitHub shows on the PR, NOT
+the branch's individual commits. Never cite a commit hash, and never reach for
+`git log` or `git blame`.
+
+You have read access to the whole repository. Use it when the answer depends on
+something outside the diff — a caller, a test, a definition — and say what you
+found. When the question is about the explanation or a review finding, judge it
+against the code: agree, disagree, or qualify, with the evidence.
+
+Write the answer as markdown for a small window: lead with the answer in one or
+two sentences, then the evidence. Clear, simple English in the style of a
+reference manual. Sentences of 25 words or less where technical correctness
+allows. `backticks` for identifiers, files and functions. No preamble, no
+restatement of the question, no closing offer. You write no files.
+]]
+
 local function pr_block(ctx)
     local pr = ctx.pr
     if type(pr) == "table" then
@@ -367,6 +394,180 @@ function M.build_review_prompt(ctx)
             .. "\n</files>\n\nReview every file in <files> for your role, and write output only for those with findings."
     )
     return table.concat(parts, "\n\n")
+end
+
+--- The prompt for a question about one selection of one file: the PR, the
+--- chapter the file belongs to, the file's diff, the selected lines as they
+--- stand in the working tree, what the explain run said about that change,
+--- what the reviewers found there, and the question.
+--- @param ctx table { pr, branch, base_ref, chapter, path, diff, first, last,
+---        lines (the selected working-file lines), explanations (list of
+---        { start, end, title, body }), findings (list of { role, severity,
+---        title, body }), question, budget }
+function M.build_ask_prompt(ctx)
+    local parts = { pr_block(ctx) }
+    if ctx.chapter then
+        table.insert(
+            parts,
+            string.format(
+                "<chapter title=%q>\n%s\n</chapter>",
+                tostring(ctx.chapter.title or ""),
+                vim.trim(ctx.chapter.summary or "")
+            )
+        )
+    end
+    local diff = ctx.diff or ""
+    local budget = ctx.budget or 60000
+    if #diff > budget then
+        diff = diff:sub(1, budget) .. "\n… (diff truncated; fetch the rest with git diff)"
+    end
+    table.insert(parts, string.format("<diff path=%q>\n%s\n</diff>", ctx.path, vim.trim(diff)))
+
+    local numbered = {}
+    for i, l in ipairs(ctx.lines or {}) do
+        table.insert(numbered, string.format("%6d  %s", ctx.first + i - 1, l))
+    end
+    table.insert(
+        parts,
+        string.format(
+            "<selection path=%q first=%d last=%d>\nThe lines the reviewer selected, as they stand in the working tree (new-side line numbers):\n%s\n</selection>",
+            ctx.path,
+            ctx.first,
+            ctx.last,
+            table.concat(numbered, "\n")
+        )
+    )
+
+    if ctx.explanations and #ctx.explanations > 0 then
+        local items = {}
+        for _, e in ipairs(ctx.explanations) do
+            table.insert(
+                items,
+                string.format(
+                    "- lines %s–%s — %s\n  %s",
+                    tostring(e.start or "?"),
+                    tostring(e["end"] or e.start or "?"),
+                    vim.trim(tostring(e.title or "")),
+                    vim.trim(tostring(e.body or "")):gsub("\n", "\n  ")
+                )
+            )
+        end
+        table.insert(
+            parts,
+            "<explanation>\nWhat an earlier agent wrote about this change, shown beside the diff:\n"
+                .. table.concat(items, "\n")
+                .. "\n</explanation>"
+        )
+    end
+
+    if ctx.findings and #ctx.findings > 0 then
+        local items = {}
+        for _, f in ipairs(ctx.findings) do
+            table.insert(
+                items,
+                string.format(
+                    "- [%s · %s] lines %s–%s — %s\n  %s",
+                    tostring(f.role or "reviewer"),
+                    tostring(f.severity or "info"),
+                    tostring(f.start or "?"),
+                    tostring(f["end"] or f.start or "?"),
+                    vim.trim(tostring(f.title or "")),
+                    vim.trim(tostring(f.body or "")):gsub("\n", "\n  ")
+                )
+            )
+        end
+        table.insert(
+            parts,
+            "<review_comments>\nFindings the review panel raised on these lines:\n"
+                .. table.concat(items, "\n")
+                .. "\n</review_comments>"
+        )
+    end
+
+    table.insert(parts, string.format("<question>\n%s\n</question>", vim.trim(ctx.question or "")))
+    return table.concat(parts, "\n\n")
+end
+
+--- Ask one question and get prose back. Unlike `run`, the answer comes on
+--- stdout as the CLI's JSON envelope, and the session is kept: the envelope's
+--- `session_id` is handed back so a follow-up can `--resume` it.
+--- @param opts table|nil { resume = <session id> }
+--- @param cb function (ok, text_or_err, session_id)
+function M.ask(prompt, contract, paths, cfg, opts, cb)
+    opts = opts or {}
+    if vim.fn.executable(cfg.cmd[1]) ~= 1 then
+        vim.schedule(function()
+            cb(false, cfg.cmd[1] .. " is not on $PATH")
+        end)
+        return nil
+    end
+
+    -- Read-only: the question needs no output files, so Write and its kin are
+    -- not even offered. The repository deny rule stays as a second lock.
+    local tools = {}
+    for _, t in ipairs(cfg.tools or {}) do
+        if not t:match("^Write") and not t:match("^Edit") and not t:match("^MultiEdit") and not t:match("^NotebookEdit") then
+            table.insert(tools, t)
+        end
+    end
+    local deny = {}
+    for _, tool in ipairs({ "Write", "Edit", "MultiEdit", "NotebookEdit" }) do
+        table.insert(deny, string.format("%s(/%s/**)", tool, paths.repo))
+    end
+    local settings = vim.json.encode({ permissions = { deny = deny } })
+
+    local args = vim.deepcopy(cfg.cmd)
+    vim.list_extend(args, {
+        "-p",
+        "--output-format",
+        "json",
+        "--permission-mode",
+        "dontAsk",
+        "--allowedTools",
+        table.concat(tools, " "),
+        "--settings",
+        settings,
+    })
+    if opts.resume then
+        vim.list_extend(args, { "--resume", opts.resume })
+    else
+        vim.list_extend(args, { "--append-system-prompt", contract })
+    end
+    local model = (opts.model and opts.model ~= "" and opts.model) or (cfg.model ~= "" and cfg.model) or nil
+    if model then
+        vim.list_extend(args, { "--model", model })
+    end
+    vim.list_extend(args, cfg.extra_args or {})
+
+    return vim.system(args, {
+        cwd = paths.repo,
+        text = true,
+        stdin = prompt,
+        timeout = cfg.timeout,
+    }, function(res)
+        vim.schedule(function()
+            local envelope = M.extract_json(res.stdout or "")
+            if res.code ~= 0 and not (envelope and envelope.result) then
+                local why = vim.trim(res.stderr or "")
+                if why == "" then
+                    why = res.signal ~= 0 and "timed out or was cancelled" or ("exit " .. tostring(res.code))
+                end
+                cb(false, why)
+                return
+            end
+            if not envelope then
+                -- No envelope at all: whatever came out is the answer.
+                cb(true, vim.trim(res.stdout or ""), nil)
+                return
+            end
+            local text = type(envelope.result) == "string" and envelope.result or vim.inspect(envelope.result)
+            if envelope.is_error then
+                cb(false, vim.trim(text))
+                return
+            end
+            cb(true, vim.trim(text), envelope.session_id)
+        end)
+    end)
 end
 
 --- Pull the JSON object out of a reply that may have wrapped it in a fence or a
@@ -587,5 +788,6 @@ end
 M.GUIDE_CONTRACT = GUIDE_CONTRACT
 M.EXPLAIN_CONTRACT = EXPLAIN_CONTRACT
 M.REVIEW_CONTRACT = REVIEW_CONTRACT
+M.ASK_CONTRACT = ASK_CONTRACT
 
 return M

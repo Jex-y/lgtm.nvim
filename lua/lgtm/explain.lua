@@ -128,6 +128,30 @@ function M.load_guide(session)
     return store.load_guide(store_dir(session))
 end
 
+--- Which roles have findings on which paths, as one string: the tree's dots
+--- change exactly when this does.
+function M.review_signature(session)
+    local parts = {}
+    for path, by_role in pairs(session.review_store or {}) do
+        for key, comments in pairs(by_role) do
+            if #comments > 0 then
+                table.insert(parts, path .. "=" .. key)
+            end
+        end
+    end
+    table.sort(parts)
+    return table.concat(parts, ";")
+end
+
+--- The stored explanations and review findings, loaded on demand — the tree's
+--- reviewer dots and the ask float both want them whether or not a column is
+--- open. Cached on the session; `reload` refreshes them when a run writes.
+function M.ensure_loaded(session)
+    session.explain_store = session.explain_store or store.load(store_dir(session))
+    session.review_store = session.review_store or store.load_reviews(store_dir(session))
+    return session.explain_store, session.review_store
+end
+
 -- ---------------------------------------------------------------------------
 -- Rendering
 -- ---------------------------------------------------------------------------
@@ -207,6 +231,22 @@ local function build_regions(hunks, context, view_height)
 end
 
 M._build_regions = build_regions
+
+--- The regions of the file on show, computed from its hunks the same way the
+--- columns compute them, so "the hunk under the cursor" means the same block
+--- the explanation column would put beside it.
+function M.regions_for(session)
+    if not session.hunks or #session.hunks == 0 then
+        return {}
+    end
+    if session.explain_regions and #session.explain_regions > 0 then
+        return session.explain_regions
+    end
+    local height = (session.working_win and vim.api.nvim_win_is_valid(session.working_win))
+            and vim.api.nvim_win_get_height(session.working_win)
+        or nil
+    return build_regions(session.hunks, diff_context(), height)
+end
 
 --- Display rows the code pane leaves beside region `i`, from its first line up to
 --- the next region's. Display rows, not buffer lines: the gap between two regions
@@ -1269,8 +1309,12 @@ function M.reload(session)
     local current_path = (session.entries[session.index] or {}).path
     local before = (session.explain_store or {})[current_path]
     local reviews_before = vim.json.encode((session.review_store or {})[current_path] or {})
+    local dots_before = M.review_signature(session)
     session.explain_store = store.load(store_dir(session))
     session.review_store = store.load_reviews(store_dir(session))
+    if session.on_reviews and M.review_signature(session) ~= dots_before then
+        session.on_reviews()
+    end
     -- The guide arrives through the same watcher as the explanations — it is the
     -- run's first write. Compared as JSON so a refinement at the end of the run
     -- also lands.

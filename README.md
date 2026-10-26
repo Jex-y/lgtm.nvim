@@ -3,7 +3,7 @@
 Review your branch's PR diff without leaving the editor — and fix things while
 you're in there.
 
-![Picking a branch and opening its PR diff](assets/pick-and-open.gif)
+![The full review view: PR description, chapters, file tree, base and working panes, AI comments, and the review column](assets/review.gif)
 
 - **Edit in place.** The right-hand pane is the real working-tree file, not a
   copy. See a problem, fix it, `:w`, keep reviewing. The diff updates as you
@@ -25,7 +25,7 @@ With [lazy.nvim](https://github.com/folke/lazy.nvim):
         "nvim-tree/nvim-web-devicons",       -- optional: file icons in the tree
         "nvim-telescope/telescope.nvim",     -- optional: only for :LgtmPick
     },
-    cmd = { "LgtmEdit", "LgtmClose", "LgtmPick", "LgtmPr", "LgtmExplain" },
+    cmd = { "LgtmEdit", "LgtmClose", "LgtmPick", "LgtmPr", "LgtmExplain", "LgtmAsk" },
     keys = { { "<leader>gd", "<cmd>LgtmEdit<CR>", desc = "PR diff review" } },
     config = function()
         require("lgtm").setup({})
@@ -78,6 +78,7 @@ pass one explicitly: `:LgtmEdit origin/release-2`.
 | `<End>` | any pane | toggle viewed — ticking advances to the next file |
 | `<leader>ge` | any pane | toggle the AI comments column |
 | `<leader>gw` | any pane | pick AI reviewers (one or many) |
+| `<leader>ga` | diff panes | ask the AI about the hunk under the cursor, or the selected lines |
 | `]c` / `[c` | diff panes | next / previous hunk (Vim built-in) |
 | `<CR>` | tree | open file, or fold a directory |
 | `v` | tree | toggle viewed |
@@ -195,7 +196,9 @@ the bottom of the column is the key:
 ```
 
 Comments carry no role prefix — the colour is the byline, and the legend is
-the key. Each finding leads with a severity icon in the theme's diagnostic
+the key. The file tree carries the same colours: a file with findings gets one
+dot per reviewer role after its name, so the files worth a closer look stand
+out before you open them. Each finding leads with a severity icon in the theme's diagnostic
 colours:  risk (can break production),  warn (should be fixed),
  info (the author may decline). A reviewer with nothing to say writes nothing — silent regions stay blank, and
 an empty review is a valid review. Findings are cached with the explanations,
@@ -203,7 +206,42 @@ per branch. The review column has its own lifecycle: it stays up when
 `<leader>ge` closes the comments column, and closes with `:LgtmReviewClose` or
 the session.
 
+## Asking about a hunk
+
+```
+<leader>ga              ask about the hunk under the cursor
+V … <leader>ga          ask about the selected lines
+:LgtmAsk [question]     the same, from the command line (takes a range)
+```
+
+The question box is a small float that wraps and takes several lines: type,
+`<C-s>` sends (or `<CR>` from normal mode), `<Esc><Esc>` cancels. The answer
+opens in a float. The agent is given the pull
+request, the file's diff, the selected lines as they stand in the working tree,
+the explanation the comments column wrote for that change, and any findings the
+review panel raised on it — so the question can be about the code, about the
+explanation, or about a reviewer's comment, and the answer is judged against all
+three with the repository readable behind it.
+
+```
+┌ 󰙴 ASK — image_names.py:120–134 ───────────────────────────────────┐
+│ ▌ is the security finding here real, or does the caller validate? │
+│                                                                   │
+│   The finding stands. `allocate_name` is called from …            │
+│                                                                   │
+│   1 explanation · 2 findings in hand   ·   <leader>ga follow-up · q close │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+Inside the float, `<leader>ga` (or `a`) asks a follow-up in the same thread: the
+agent session is resumed, so it remembers the hunk and what it already said.
+Each new `<leader>ga` from the diff starts a fresh thread. `q` closes the float.
+The prompt line says what is in hand — `(+explanation, 2 findings)` — before you
+type.
+
 ## Picking a branch
+
+![Picking a branch and opening its PR diff](assets/pick-and-open.gif)
 
 ```
 :LgtmPick
@@ -236,7 +274,7 @@ require("lgtm").setup({
     tree_width = 60,            -- width of the left column
     desc_height = 0.45,         -- fraction of it given to the PR description
     base_width = nil,           -- fixed width for the base pane; nil splits evenly
-    include_untracked = true,   -- show files git doesn't know about yet
+    include_untracked = false,  -- also show files git does not know about yet
     advance = "next",           -- after ticking: "next" | "next_unviewed" | "none"
     generated = "skip",         -- "skip" pre-ticks generated files; "show" doesn't
     ruler = true,               -- change-position strip on the working pane's edge
@@ -246,6 +284,10 @@ require("lgtm").setup({
         model = "sonnet",       -- "" omits --model
         max_parallel = 3,       -- chapter runs in flight at once
         timeout = 1800000,      -- per run; a chapter is a fraction of the PR
+    },
+    ask = {                     -- asking about a hunk
+        model = nil,            -- nil uses explain.model
+        width = 100,            -- the answer float
     },
     diff_colors = {},           -- calmer diff tints derived from your theme;
                                 -- false keeps the colourscheme's own colours
