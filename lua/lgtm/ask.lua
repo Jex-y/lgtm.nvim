@@ -493,7 +493,8 @@ end
 --- submit; <Esc> in normal mode, or q, cancels. Empty text cancels too.
 --- @param title string shown in the border
 --- @param cb function called once with the trimmed text, or nil when cancelled
-local function prompt(session, title, cb)
+--- @param opts table|nil `verb` names what submitting does, in the footer
+local function prompt(session, title, cb, opts)
     local cfg = session.cfg.ask or {}
     local cols, lines = vim.o.columns, vim.o.lines - vim.o.cmdheight
     local width = math.min(cfg.width or 100, cols - 8)
@@ -520,7 +521,7 @@ local function prompt(session, title, cb)
         border = gradient_border(),
         title = gradient_title(" " .. title .. " "),
         title_pos = "left",
-        footer = " <C-s> or <CR> in normal mode asks · <Esc><Esc> cancels ",
+        footer = " <C-s> or <CR> in normal mode " .. (opts and opts.verb or "asks") .. " · <Esc><Esc> cancels ",
         footer_pos = "right",
         width = width,
         height = height,

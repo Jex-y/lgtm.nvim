@@ -78,6 +78,7 @@ pass one explicitly: `:LgtmEdit origin/release-2`.
 | `]C` / `[C` | any pane | next / previous commit (ALL → first → … → last) |
 | `<leader>gy` | any pane | approve the selected commit — advances to the next unapproved one |
 | `a` | commit picker | approve the commit under the cursor |
+| `<leader>gn` | diff panes | comment on GitHub on the line under the cursor, or the selected lines |
 | `<End>` | any pane | toggle viewed — ticking advances to the next file |
 | `<leader>ge` | any pane | toggle the AI comments column |
 | `<leader>gw` | any pane | pick AI reviewers (one or many) |
@@ -117,6 +118,17 @@ own change moves, its approval lapses and it comes back for review.
 
 The AI columns explain the branch as a whole, so they are only available with
 `ALL` selected.
+
+### GitHub comments
+
+`<leader>gn` (or `:LgtmComment [text]`, which takes a range) posts a review
+comment on the PR through `gh api`, on the line under the cursor or the visual
+selection. From the right-hand pane it lands on the new side; from BASE, on the
+old side. The PR's existing threads show at the end of the lines they sit on.
+
+GitHub anchors comments to pushed commits, so the working file's lines are
+mapped back to the PR head; a line with unpushed edits is refused rather than
+guessed at. In commit mode the comment is anchored to the selected commit.
 
 ## The AI comments column
 

@@ -6,6 +6,7 @@
 -- exists on the PR's target branch, and the live editable working-tree file.
 
 local ask = require("lgtm.ask")
+local comments = require("lgtm.comments")
 local explain = require("lgtm.explain")
 local git = require("lgtm.git")
 local layout = require("lgtm.layout")
@@ -187,6 +188,10 @@ local defaults = {
         -- Ask about the hunk under the cursor, or the visually selected lines.
         -- Inside the answer float the same key asks a follow-up.
         ask = "<leader>ga",
+        -- Post a GitHub review comment on the line under the cursor, or the
+        -- visually selected lines. Existing threads show at the end of the
+        -- lines they sit on.
+        comment = "<leader>gn",
         tree_toggle_viewed = "v",
         tree_open = "<CR>",
         tree_fold = "za",
@@ -541,6 +546,7 @@ local function goto_index(idx, focus_working)
     -- After show_file, which is what computes session.hunks — the explanation
     -- blocks are keyed to them.
     explain.refresh(session)
+    comments.decorate(session)
     if focus_working ~= false and vim.api.nvim_win_is_valid(session.working_win) then
         vim.api.nvim_set_current_win(session.working_win)
     end
@@ -1043,6 +1049,7 @@ local function close_session(force)
     -- Before layout.close: a float left open when its parent tab goes can strand
     -- the window or block the tabclose.
     ask.close(session)
+    comments.clear(session)
     ruler.close(session)
     explain.close_review(session)
     explain.close(session)
@@ -1089,6 +1096,16 @@ function apply_keys(buf, is_tree)
             vim.cmd([[execute "normal! \<Esc>"]])
             ask.ask(session, { first = math.min(first, last), last = math.max(first, last), win = win })
         end, { buffer = buf, nowait = true, silent = true, desc = "lgtm: ask about these lines" })
+    end
+    map(buf, k.comment, function() comments.comment(session) end, "comment on this line on GitHub")
+    if k.comment and k.comment ~= "" then
+        vim.keymap.set("x", k.comment, function()
+            local first = vim.fn.line("v")
+            local last = vim.fn.line(".")
+            local win = vim.api.nvim_get_current_win()
+            vim.cmd([[execute "normal! \<Esc>"]])
+            comments.comment(session, { first = math.min(first, last), last = math.max(first, last), win = win })
+        end, { buffer = buf, nowait = true, silent = true, desc = "lgtm: comment on these lines on GitHub" })
     end
     map(buf, k.close, function() close_session(false) end, "close session")
     if is_tree then
@@ -1160,6 +1177,7 @@ function M.open(base_arg, opts)
     markdown.setup_highlights(cfg.diff_colors)
     explain.setup_highlights(cfg.diff_colors)
     ask.setup_highlights()
+    comments.setup_highlights()
     local wins = layout.create(cfg)
 
     -- Tab-local, so a session opened in another worktree gets that directory
@@ -1365,6 +1383,7 @@ function M.open(base_arg, opts)
                     vim.o.fillchars = session.saved_opts.fillchars
                 end
                 ruler.close(session)
+                comments.clear(session)
                 explain.stop_run(session)
                 session = nil
             end
@@ -1386,6 +1405,11 @@ function M.open(base_arg, opts)
         if not session.chapter then
             render_desc()
         end
+        comments.load(session, function()
+            if session_valid() then
+                comments.decorate(session)
+            end
+        end)
     end)
 
     apply_keys(session.tree_buf, true)
@@ -1494,6 +1518,22 @@ function M.setup(opts)
         nargs = "?",
         range = true,
         desc = "Ask the AI about the hunk under the cursor or the given range",
+    })
+
+    vim.api.nvim_create_user_command("LgtmComment", function(args)
+        if not session then
+            vim.notify("lgtm: no session open", vim.log.levels.WARN)
+            return
+        end
+        local opts = { body = args.args ~= "" and args.args or nil }
+        if args.range and args.range > 0 then
+            opts.first, opts.last = args.line1, args.line2
+        end
+        comments.comment(session, opts)
+    end, {
+        nargs = "?",
+        range = true,
+        desc = "Post a GitHub review comment on the cursor line or the given range",
     })
 
     vim.api.nvim_create_user_command("LgtmPr", function(args)

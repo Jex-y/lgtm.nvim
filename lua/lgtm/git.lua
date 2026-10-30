@@ -116,7 +116,7 @@ function M.dirty_files(cwd)
     return files
 end
 
-local PR_FIELDS = "number,title,body,author,state,baseRefName,additions,deletions,changedFiles,url,isDraft"
+local PR_FIELDS = "number,title,body,author,state,baseRefName,headRefOid,additions,deletions,changedFiles,url,isDraft"
 
 --- The open PR for `branch`, fetched asynchronously — gh goes to the network, so
 --- a synchronous call would stall the UI on every selection change.
