@@ -71,7 +71,7 @@ pass one explicitly: `:LgtmEdit origin/release-2`.
 
 | Key | Where | Action |
 |---|---|---|
-| `m` / `n` | any pane | next / previous changed file |
+| `<Tab>` / `<S-Tab>` | any pane | next / previous changed file |
 | `<PageDown>` / `<PageUp>` | any pane | same, alternate binding |
 | `M` / `N` | any pane | next / previous chapter of work |
 | `<S-PageDown>` / `<S-PageUp>` | any pane | same, alternate binding |
@@ -88,8 +88,9 @@ pass one explicitly: `:LgtmEdit origin/release-2`.
 | `q` | tree | close the session |
 
 All bindings are buffer-local to the session's panes and configurable through
-`keys`. Note that `m`/`n` shadow Vim's search-repeat inside those panes; rebind
-them (for example back to `]f`/`[f`) if that matters to you.
+`keys`. Note that `<Tab>` is `<C-i>` to most terminals, so it shadows
+jumplist-forward inside those panes; rebind it (for example to `]f`/`[f`) if
+that matters to you.
 
 Viewed ticks persist per branch, so a half-finished review resumes where you
 left it. Ticks are dropped for files that changed after you ticked them.

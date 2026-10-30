@@ -164,13 +164,10 @@ local defaults = {
     keys = {
         next_file = "<PageDown>",
         prev_file = "<PageUp>",
-        -- m/n rather than ]f/[f: adjacent home-row-adjacent keys, m to the right
-        -- for forward, n to the left for back, so flicking through a review is a
-        -- single finger. Buffer-local to the session's panes — but they do
-        -- shadow Vim's search-repeat inside them. Restore with
-        -- keys = { next_file_alt = "]f", ... } if search-repeat matters more.
-        next_file_alt = "m",
-        prev_file_alt = "n",
+        -- Buffer-local to the session's panes, but <Tab> is <C-i> to the
+        -- terminal, so these shadow jumplist-forward inside them.
+        next_file_alt = "<Tab>",
+        prev_file_alt = "<S-Tab>",
         next_chapter = "<S-PageDown>",
         prev_chapter = "<S-PageUp>",
         next_chapter_alt = "M",
@@ -190,7 +187,6 @@ local defaults = {
         -- Ask about the hunk under the cursor, or the visually selected lines.
         -- Inside the answer float the same key asks a follow-up.
         ask = "<leader>ga",
-        -- Not "m", which is next-file everywhere now.
         tree_toggle_viewed = "v",
         tree_open = "<CR>",
         tree_fold = "za",
