@@ -175,6 +175,10 @@ local defaults = {
         prev_chapter = "<S-PageUp>",
         next_chapter_alt = "M",
         prev_chapter_alt = "N",
+        -- Step through the branch a commit at a time: ALL → first commit → … →
+        -- last, wrapping.
+        next_commit = "]C",
+        prev_commit = "[C",
         toggle_viewed = "<End>",
         toggle_explain = "<leader>ge",
         -- The reviewer checklist: pick one or many roles to run in parallel.
@@ -248,7 +252,23 @@ local function render_desc()
     end
     local width = vim.api.nvim_win_get_width(session.desc_win)
     local f = session.chapter and session.guide and session.guide.chapters[session.chapter] or nil
-    if f then
+    local commit = session.commit
+    if commit then
+        local viewed = 0
+        for _, e in ipairs(session.entries) do
+            if session.store:is_viewed(e.path) then
+                viewed = viewed + 1
+            end
+        end
+        markdown.apply(
+            session.desc_buf,
+            markdown.render_chapter(
+                { title = commit.subject, summary = commit.body },
+                { files = #session.entries, added = commit.added, deleted = commit.deleted, viewed = viewed },
+                width
+            )
+        )
+    elseif f then
         local rows = chapter_rows()
         markdown.apply(
             session.desc_buf,
@@ -370,6 +390,97 @@ local function open_chapter_picker()
     redraw_chapters()
 end
 
+local function commit_picker_open()
+    return session ~= nil and session.commit_win ~= nil and vim.api.nvim_win_is_valid(session.commit_win)
+end
+
+--- The viewed store for one commit, opened once and kept: a commit's files
+--- never change, so its marks need no pruning and its count is cheap to show.
+local function commit_store(c, is_tip)
+    session.commit_stores = session.commit_stores or {}
+    local s = session.commit_stores[c.sha]
+    if not s then
+        s = state.open(session.common_dir, session.branch .. "@" .. c.sha, session.root, { immutable = not is_tip })
+        session.commit_stores[c.sha] = s
+    end
+    return s
+end
+
+local function save_stores()
+    session.branch_store:save(session.merge_base)
+    for _, s in pairs(session.commit_stores or {}) do
+        s:save(session.merge_base)
+    end
+end
+
+local function redraw_commits()
+    if not (session_valid() and commit_picker_open()) then
+        return
+    end
+    local rows = {}
+    for i, c in ipairs(session.commits) do
+        local viewed = commit_store(c, i == #session.commits):count_viewed()
+        table.insert(rows, vim.tbl_extend("force", c, { viewed = viewed }))
+    end
+    session.commit_map = tree.render_commits(session.commit_buf, {
+        commits = rows,
+        selected = session.commit and session.commit.index or nil,
+        width = session.cfg.tree_width,
+    })
+    local content = vim.api.nvim_buf_line_count(session.commit_buf)
+    local column = vim.api.nvim_win_get_height(session.commit_win) + vim.api.nvim_win_get_height(session.tree_win)
+    pcall(vim.api.nvim_win_set_height, session.commit_win, math.max(2, math.min(content, math.floor(column / 3))))
+    local selected = session.commit and session.commit.index or 0
+    pcall(vim.api.nvim_win_set_cursor, session.commit_win, { selected + 1, 0 })
+end
+
+--- The commit picker sits between the description and the tree for the whole
+--- session, whenever the branch has commits of its own.
+local function open_commit_picker()
+    if not session_valid() or commit_picker_open() or #session.commits == 0 then
+        return
+    end
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.bo[buf].buftype = "nofile"
+    vim.bo[buf].bufhidden = "wipe"
+    vim.bo[buf].swapfile = false
+    pcall(vim.api.nvim_buf_set_name, buf, "lgtm://commits")
+    vim.bo[buf].filetype = "lgtm-commits"
+
+    local prev = vim.api.nvim_get_current_win()
+    local win
+    vim.api.nvim_win_call(session.tree_win, function()
+        vim.cmd("leftabove split")
+        win = vim.api.nvim_get_current_win()
+    end)
+    vim.api.nvim_win_set_buf(win, buf)
+    vim.wo[win].number = false
+    vim.wo[win].relativenumber = false
+    vim.wo[win].wrap = false
+    vim.wo[win].signcolumn = "no"
+    vim.wo[win].cursorline = false
+    vim.wo[win].winfixwidth = true
+    vim.wo[win].winfixheight = true
+    vim.wo[win].colorcolumn = ""
+    vim.wo[win].winbar = "%#LgtmWinbarLabel# COMMITS"
+    vim.api.nvim_set_current_win(prev)
+
+    apply_keys(buf, false)
+    vim.keymap.set("n", "<CR>", function()
+        local line = vim.api.nvim_win_get_cursor(win)[1]
+        local item = session and session.commit_map and session.commit_map[line]
+        if item then
+            M._select_commit(item.index ~= 0 and item.index or nil, { focus = true })
+        end
+    end, { buffer = buf, nowait = true, silent = true, desc = "lgtm: select commit" })
+    vim.keymap.set("n", "q", function()
+        M.close()
+    end, { buffer = buf, nowait = true, silent = true, desc = "lgtm: close session" })
+
+    session.commit_win, session.commit_buf = win, buf
+    redraw_commits()
+end
+
 local function redraw_tree()
     if not session_valid() then
         return
@@ -380,7 +491,8 @@ local function redraw_tree()
         store = session.store,
         current_path = current and current.path or nil,
         folded = session.folded,
-        header = session.base_ref,
+        header = session.commit and string.format("commit %d/%d", session.commit.index, #session.commits)
+            or session.base_ref,
         width = session.cfg.tree_width,
         -- A dot per reviewer role with findings on the file.
         reviews = session.review_store,
@@ -397,6 +509,10 @@ local function redraw_tree()
     end
     -- The picker's viewed stats move with the tree's, so the two redraw as one.
     redraw_chapters()
+    redraw_commits()
+    if session.commit then
+        render_desc()
+    end
 end
 
 local function goto_index(idx, focus_working)
@@ -465,11 +581,117 @@ end
 
 M._select_chapter = select_chapter
 
+--- Whether an AI pane may be used. They are built from the branch's
+--- cumulative diff, so their regions do not line up with one commit's.
+local function ai_allowed()
+    if session.commit then
+        notify("the AI columns cover the whole branch — select ALL commits first")
+        return false
+    end
+    return true
+end
+
+--- Select one commit of the branch (nil for ALL). The panes diff the commit
+--- against its parent; the tip commit keeps the editable working file, so the
+--- diff there also carries any uncommitted edits. Viewed marks are kept per
+--- commit, apart from the branch's own.
+--- @param idx number|nil index into session.commits
+--- @param opts table|nil `focus` hands focus to the working pane afterwards
+--- @return boolean selected false when the commit changes no files
+local function select_commit(idx, opts)
+    if not session_valid() then
+        return false
+    end
+    local entries, store, diff_base, diff_head, commit
+    if idx then
+        local c = session.commits[idx]
+        if not c then
+            return false
+        end
+        local is_tip = idx == #session.commits
+        diff_base, diff_head = c.parent, not is_tip and c.sha or nil
+        entries = git.changed_files(diff_base, session.root, { head = diff_head, include_untracked = false })
+        if #entries == 0 then
+            notify("commit " .. c.short .. " changes no files")
+            return false
+        end
+        entries = tree.display_order(entries)
+        store = commit_store(c, is_tip)
+        if is_tip then
+            store:prune(entries)
+        end
+        if session.cfg.generated == "skip" then
+            for _, e in ipairs(entries) do
+                if e.generated and not store:is_viewed(e.path) then
+                    store:set_viewed(e.path, true)
+                end
+            end
+        end
+        c.body = c.body or git.commit_body(c.sha, session.root)
+        commit = vim.tbl_extend("force", c, { index = idx })
+    else
+        entries, store = session.all_entries, session.branch_store
+        diff_base, diff_head = session.merge_base, nil
+    end
+
+    if commit and (explain.is_open(session) or explain.review_open(session)) then
+        explain.close_review(session)
+        if explain.is_open(session) then
+            M._toggle_explain()
+        end
+    end
+    ask.close(session)
+
+    local current = session.entries[session.index]
+    session.store:save(session.merge_base)
+    session.commit, session.store = commit, store
+    session.diff_base, session.diff_head = diff_base, diff_head
+    session.chapter = nil
+    session.entries = entries
+    local target = 1
+    for i, e in ipairs(entries) do
+        if current and e.path == current.path then
+            target = i
+            break
+        end
+    end
+    render_desc()
+    goto_index(target, opts and opts.focus or false)
+    return true
+end
+
+M._select_commit = select_commit
+
+--- Cycle ALL → first commit → … → last, wrapping, stepping over commits that
+--- change no files.
+local function step_commit(delta)
+    if not session_valid() then
+        return
+    end
+    local n = #session.commits
+    if n == 0 then
+        notify("no commits on this branch yet")
+        return
+    end
+    local cur = session.commit and session.commit.index or 0
+    for _ = 1, n + 1 do
+        cur = (cur + delta) % (n + 1)
+        if select_commit(cur ~= 0 and cur or nil) then
+            return
+        end
+    end
+end
+
+M._step_commit = step_commit
+
 --- Cycle through the picker from any pane: ALL → chapter 1 → … → chapter n,
 --- wrapping. Chapters that match no real files are stepped over, the same way the
 --- picker refuses them.
 local function step_chapter(delta)
     if not session_valid() then
+        return
+    end
+    if not ai_allowed() then
         return
     end
     if not explain.is_open(session) then
@@ -582,6 +804,9 @@ local function toggle_explain(force)
         ruler.update(session)
         return
     end
+    if not ai_allowed() then
+        return
+    end
     if not explain.open(session) then
         return
     end
@@ -595,7 +820,7 @@ M._toggle_explain = toggle_explain
 
 --- Launch a set of reviewer roles over the selected chapter (or everything).
 local function start_reviews(keys_list)
-    if not session_valid() then
+    if not session_valid() or not ai_allowed() then
         return
     end
     for _, key in ipairs(keys_list) do
@@ -611,7 +836,7 @@ end
 --- <Space> ticks, `a` ticks everything, <CR> launches the ticked roles in
 --- parallel, q or <Esc> cancels.
 local function review_checklist()
-    if not session_valid() then
+    if not session_valid() or not ai_allowed() then
         return
     end
     local roles = require("lgtm.reviewers").roles
@@ -761,7 +986,7 @@ local function close_session(force)
             end
         end
     end
-    session.store:save(session.merge_base)
+    save_stores()
     -- Before layout.close: a float left open when its parent tab goes can strand
     -- the window or block the tabclose.
     ask.close(session)
@@ -769,6 +994,9 @@ local function close_session(force)
     explain.close_review(session)
     explain.close(session)
     close_chapter_picker()
+    if commit_picker_open() then
+        pcall(vim.api.nvim_win_close, session.commit_win, true)
+    end
     layout.close(session)
     session = nil
 end
@@ -795,6 +1023,8 @@ function apply_keys(buf, is_tree)
     map(buf, k.toggle_viewed, toggle_viewed, "toggle viewed")
     map(buf, k.toggle_explain, function() toggle_explain(false) end, "toggle the explanation column")
     map(buf, k.review, review_checklist, "pick AI reviewers")
+    map(buf, k.next_commit, function() step_commit(1) end, "next commit")
+    map(buf, k.prev_commit, function() step_commit(-1) end, "previous commit")
     map(buf, k.ask, function() ask.ask(session) end, "ask about this hunk")
     if k.ask and k.ask ~= "" then
         -- Visual mode: the selected lines are the subject.
@@ -859,7 +1089,8 @@ function M.open(base_arg, opts)
     -- stepping must follow the order the tree displays.
     entries = tree.display_order(entries)
 
-    local store = state.open(git.common_dir(root), git.branch(root), root)
+    local common_dir = git.common_dir(root)
+    local store = state.open(common_dir, branch, root)
     store:prune(entries)
     if cfg.generated == "skip" then
         for _, e in ipairs(entries) do
@@ -887,6 +1118,14 @@ function M.open(base_arg, opts)
         base_ref = base_ref,
         branch = branch,
         merge_base = merge_base,
+        common_dir = common_dir,
+        -- The range the panes diff: the merge base against the working tree for
+        -- the whole branch, or one commit against its parent. `diff_head` nil
+        -- means the working tree.
+        diff_base = merge_base,
+        diff_head = nil,
+        commits = git.commits(merge_base, root),
+        commit = nil,
         -- `entries` is what the tree shows and paging walks; `all_entries` is the
         -- whole change, which is what the explanation run and the chapter stats
         -- are always about. Same entry tables in both, so counts and viewed
@@ -894,7 +1133,10 @@ function M.open(base_arg, opts)
         entries = entries,
         all_entries = entries,
         chapter = nil,
+        -- `store` holds the viewed marks for what is on show: the branch's own
+        -- store, or the selected commit's.
         store = store,
+        branch_store = store,
         index = 1,
         folded = {},
     })
@@ -960,19 +1202,32 @@ function M.open(base_arg, opts)
             end
             local name = vim.api.nvim_buf_get_name(args.buf)
             local rel = name:sub(#session.root + 2)
-            for _, e in ipairs(session.all_entries) do
-                if e.path == rel then
-                    local fresh = git.changed_files(session.merge_base, session.root, {
-                        include_untracked = session.cfg.include_untracked,
-                    })
-                    for _, f in ipairs(fresh) do
-                        if f.path == rel then
-                            e.added, e.deleted, e.no_counts = f.added, f.deleted, f.no_counts
+            -- With a commit selected its entries are their own tables, priced
+            -- against its parent, so both lists are refreshed.
+            local lists = { { session.all_entries, session.merge_base } }
+            if session.commit then
+                table.insert(lists, { session.entries, session.diff_base })
+            end
+            local touched = false
+            for _, list in ipairs(lists) do
+                local entries, base = list[1], list[2]
+                for _, e in ipairs(entries) do
+                    if e.path == rel then
+                        local fresh = git.changed_files(base, session.root, {
+                            include_untracked = session.cfg.include_untracked,
+                        })
+                        for _, f in ipairs(fresh) do
+                            if f.path == rel then
+                                e.added, e.deleted, e.no_counts = f.added, f.deleted, f.no_counts
+                            end
                         end
+                        touched = true
+                        break
                     end
-                    redraw_tree()
-                    break
                 end
+            end
+            if touched then
+                redraw_tree()
             end
         end,
     })
@@ -1047,7 +1302,7 @@ function M.open(base_arg, opts)
         group = session.augroup,
         callback = function()
             if session and session.tab and not vim.api.nvim_tabpage_is_valid(session.tab) then
-                session.store:save(session.merge_base)
+                save_stores()
                 -- Closing the tab with :q never reaches layout.close, so the
                 -- borrowed global options would otherwise stay changed.
                 if session.saved_opts then
@@ -1080,6 +1335,7 @@ function M.open(base_arg, opts)
 
     apply_keys(session.tree_buf, true)
     apply_keys(session.desc_buf, false)
+    open_commit_picker()
     goto_index(1)
     notify(string.format("%d files vs %s (%s)", #entries, base_ref, source))
 end

@@ -183,6 +183,84 @@ function M.render_chapters(buf, opts)
     return line_map
 end
 
+--- Render the commit picker: "ALL", then one row per commit on the branch,
+--- oldest first, with its short sha, subject and counts.
+--- @param opts table { commits, selected, width } — `commits` rows are
+---        { short, subject, added, deleted, files, viewed }; `selected` is nil
+---        while the whole branch is shown.
+--- @return table line -> { kind = "commit", index } map (index 0 is ALL)
+function M.render_commits(buf, opts)
+    local width = opts.width or 40
+    local lines, marks, line_map = {}, {}, {}
+
+    local function row(idx, label, sub, counts, selected, done)
+        local marker = selected and ICONS.current or (done and ICONS.viewed or ICONS.unviewed)
+        local head = string.format(" %s ", marker)
+        local tail = counts and ("  " .. counts) or ""
+        local room = width - vim.fn.strdisplaywidth(head .. label .. tail) - 2
+        if sub ~= "" and room >= 6 and vim.fn.strdisplaywidth(sub) > room then
+            sub = vim.fn.strcharpart(sub, 0, room - 1) .. "…"
+        elseif room < 6 then
+            sub = ""
+        end
+        local text = head .. label .. (sub ~= "" and (" " .. sub) or "")
+        local pad = math.max(1, width - 1 - vim.fn.strdisplaywidth(text) - vim.fn.strdisplaywidth(tail))
+        text = text .. string.rep(" ", pad) .. tail
+        table.insert(lines, text)
+        local line = #lines - 1
+        line_map[#lines] = { kind = "commit", index = idx }
+        local marker_hl = selected and "LgtmCurrent" or (done and "LgtmViewed" or "Comment")
+        table.insert(marks, { line = line, col = 1, end_col = 1 + #marker, hl = marker_hl })
+        table.insert(marks, {
+            line = line,
+            col = #head,
+            end_col = #head + #label,
+            hl = selected and "LgtmCurrentName" or (idx == 0 and "Normal" or "Identifier"),
+        })
+        if sub ~= "" then
+            table.insert(marks, {
+                line = line,
+                col = #head + #label + 1,
+                end_col = #head + #label + 1 + #sub,
+                hl = done and not selected and "LgtmViewed" or "Normal",
+            })
+        end
+        if counts then
+            local plus = tail:match("^  (%S+)")
+            local start = #text - #tail + 2
+            table.insert(marks, { line = line, col = start, end_col = start + #plus, hl = "LgtmCountAdd" })
+            table.insert(marks, { line = line, col = start + #plus + 1, end_col = #text, hl = "LgtmCountDel" })
+        end
+        if selected then
+            table.insert(marks, { line = line, line_hl = "LgtmCurrentLine" })
+        end
+    end
+
+    row(0, "ALL", string.format("%d commits", #(opts.commits or {})), nil, opts.selected == nil, false)
+    for i, c in ipairs(opts.commits or {}) do
+        local done = c.files > 0 and c.viewed >= c.files
+        row(i, c.short, c.subject, string.format("+%d −%d", c.added, c.deleted), opts.selected == i, done)
+    end
+
+    vim.bo[buf].modifiable = true
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    vim.bo[buf].modifiable = false
+
+    vim.api.nvim_buf_clear_namespace(buf, NS, 0, -1)
+    for _, m in ipairs(marks) do
+        if m.line_hl then
+            vim.api.nvim_buf_set_extmark(buf, NS, m.line, 0, { line_hl_group = m.line_hl })
+        else
+            pcall(vim.api.nvim_buf_set_extmark, buf, NS, m.line, m.col, {
+                end_col = m.end_col,
+                hl_group = m.hl,
+            })
+        end
+    end
+
+    return line_map
+end
+
 --- Render the tree into `buf`, returning the line -> entry map used for
 --- navigation and cursor tracking.
 --- @param opts table { entries, store, current_path, folded, header, width,

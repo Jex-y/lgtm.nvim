@@ -251,15 +251,16 @@ function M.show_file(session, entry)
     local base_path = entry.old_path or entry.path
     local rel = entry.path
 
-    -- Left: the file as it exists on the base branch.
-    local base_buf = scratch(string.format("lgtm://%s/%s", session.merge_base:sub(1, 7), base_path))
+    -- Left: the file as it exists on the base branch, or before the selected
+    -- commit.
+    local base_buf = scratch(string.format("lgtm://%s/%s", session.diff_base:sub(1, 7), base_path))
     local base_note, raw
     if entry.status == "A" or entry.status == "U" then
         -- Added on this branch: there is no base version, so the left pane is
         -- deliberately empty and every line reads as an addition.
         base_note = "(new file)"
     else
-        raw = git.show(session.merge_base, base_path, root)
+        raw = git.show(session.diff_base, base_path, root)
         if not raw then
             base_note = "(not in base)"
         end
@@ -277,14 +278,32 @@ function M.show_file(session, entry)
 
     -- Right: the actual working-tree file, opened normally so it is editable and
     -- writable. Deleted files have nothing to open, so they get a placeholder.
+    -- A commit other than the tip has no working file to edit: the pane shows
+    -- the file as that commit left it, read-only.
     local abs = vim.fs.joinpath(root, entry.path)
     local working_note
-    if entry.status == "D" or vim.fn.filereadable(abs) == 0 then
+    local head_raw = session.diff_head and entry.status ~= "D" and git.show(session.diff_head, entry.path, root)
+    if entry.status == "D" or (session.diff_head and not head_raw) or (not session.diff_head and vim.fn.filereadable(abs) == 0) then
         local buf = scratch("lgtm://deleted/" .. entry.path)
-        vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "", "  This file is deleted on this branch.", "" })
+        local where = session.diff_head and "in this commit" or "on this branch"
+        vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "", "  This file is deleted " .. where .. ".", "" })
         vim.bo[buf].modifiable = false
         vim.api.nvim_win_set_buf(session.working_win, buf)
         working_note, diffable = "(deleted)", false
+    elseif head_raw then
+        local buf = scratch(string.format("lgtm://%s/%s", session.diff_head:sub(1, 7), entry.path))
+        local lines = vim.split(head_raw, "\n", { plain = true })
+        vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+        vim.bo[buf].modifiable = false
+        vim.api.nvim_win_set_buf(session.working_win, buf)
+        if git.is_binary(head_raw) then
+            diffable, working_note = false, "(binary)"
+        elseif #head_raw > (cfg.max_file_size or 1024 * 1024) then
+            diffable, working_note = false, "(too large to diff)"
+        end
+        local ft = vim.filetype.match({ filename = entry.path, contents = lines }) or ""
+        vim.bo[buf].filetype = ft
+        vim.bo[base_buf].filetype = ft
     else
         local size = vim.fn.getfsize(abs)
         vim.api.nvim_win_call(session.working_win, function()
@@ -380,17 +399,21 @@ function M.show_file(session, entry)
         status = "generated"
     end
 
-    set_winbar(
-        session.base_win,
-        bar(session.base_win, "BASE", base_note, session.base_ref .. " @ " .. session.merge_base:sub(1, 7))
-    )
+    local commit = session.commit
+    local base_trailing = commit and (commit.short .. "^")
+        or (session.base_ref .. " @ " .. session.merge_base:sub(1, 7))
+    local position = string.format("file %d/%d", index, total)
+    if commit then
+        position = string.format("%s · commit %d/%d · %s", commit.short, commit.index, #session.commits, position)
+    end
+    set_winbar(session.base_win, bar(session.base_win, "BASE", base_note, base_trailing))
     set_winbar(
         session.working_win,
         bar(
             session.working_win,
-            "WORKING",
+            session.diff_head and "COMMIT" or "WORKING",
             working_note or status,
-            (session.store:is_viewed(entry.path) and "✓ viewed   " or "") .. string.format("file %d/%d", index, total)
+            (session.store:is_viewed(entry.path) and "✓ viewed   " or "") .. position
         )
     )
 end

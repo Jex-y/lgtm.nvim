@@ -140,7 +140,7 @@ local function gather(session, first, last)
         chapter = chapter,
         explanations = explanations,
         findings = findings,
-        diff = git.file_diff(session.merge_base, entry, session.root) or "",
+        diff = git.file_diff(session.diff_base, entry, session.root, session.diff_head) or "",
     }
 end
 

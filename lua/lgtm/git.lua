@@ -449,7 +449,8 @@ end
 --- before it reads the repository, and context lines are the cheapest way to
 --- tell it what a hunk sits inside.
 --- @param entry table a changed-file entry, for its status and rename pair
-function M.file_diff(merge_base, entry, cwd)
+--- @param head string|nil diff up to that ref instead of the working tree
+function M.file_diff(merge_base, entry, cwd, head)
     -- Untracked files are invisible to `git diff`, so they are diffed against
     -- nothing; --no-index exits 1 when the two differ, which is the normal case
     -- here rather than a failure.
@@ -457,7 +458,11 @@ function M.file_diff(merge_base, entry, cwd)
         local out = git({ "diff", "--no-index", "-U8", "--", "/dev/null", entry.path }, cwd, true)
         return out
     end
-    local args = { "diff", "-M", "-U8", merge_base, "--", entry.path }
+    local args = { "diff", "-M", "-U8", merge_base }
+    if head then
+        table.insert(args, head)
+    end
+    vim.list_extend(args, { "--", entry.path })
     -- A rename only reads as one when both ends of the pair are in the pathspec;
     -- with just the new path git reports an added file and the reviewer loses the
     -- fact that anything moved.
@@ -465,6 +470,52 @@ function M.file_diff(merge_base, entry, cwd)
         table.insert(args, entry.old_path)
     end
     return (git(args, cwd, true))
+end
+
+--- The branch's commits since the merge base, oldest first, each priced by
+--- its own diff. First-parent only: a merge from the base branch is one step of
+--- the branch, not the history it brought in.
+--- @return table list of { sha, short, parent, subject, files, added, deleted }
+function M.commits(merge_base, cwd)
+    local out = git({
+        "log",
+        "--reverse",
+        "--first-parent",
+        "--numstat",
+        "--format=%x01%H%x00%h%x00%P%x00%s",
+        merge_base .. "..HEAD",
+    }, cwd, true)
+    local commits = {}
+    for record in out:gmatch("\1([^\1]*)") do
+        local header, rest = record:match("^([^\n]*)\n?(.*)$")
+        local sha, short, parents, subject = header:match("^(%x+)%z(%x+)%z([^%z]*)%z(.*)$")
+        if sha then
+            local c = {
+                sha = sha,
+                short = short,
+                parent = parents:match("^(%x+)"),
+                subject = subject,
+                files = 0,
+                added = 0,
+                deleted = 0,
+            }
+            for added, deleted in rest:gmatch("([%d%-]+)\t([%d%-]+)\t[^\n]*") do
+                c.files = c.files + 1
+                c.added = c.added + (tonumber(added) or 0)
+                c.deleted = c.deleted + (tonumber(deleted) or 0)
+            end
+            if c.parent then
+                table.insert(commits, c)
+            end
+        end
+    end
+    return commits
+end
+
+--- A commit's message body, without the subject line.
+function M.commit_body(sha, cwd)
+    local out = git({ "log", "-1", "--format=%b", sha }, cwd, true)
+    return vim.trim(out)
 end
 
 --- Contents of `path` at `rev`. Returns nil when the file did not exist there,

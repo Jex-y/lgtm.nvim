@@ -75,6 +75,7 @@ pass one explicitly: `:LgtmEdit origin/release-2`.
 | `<PageDown>` / `<PageUp>` | any pane | same, alternate binding |
 | `M` / `N` | any pane | next / previous chapter of work |
 | `<S-PageDown>` / `<S-PageUp>` | any pane | same, alternate binding |
+| `]C` / `[C` | any pane | next / previous commit (ALL → first → … → last) |
 | `<End>` | any pane | toggle viewed — ticking advances to the next file |
 | `<leader>ge` | any pane | toggle the AI comments column |
 | `<leader>gw` | any pane | pick AI reviewers (one or many) |
@@ -92,6 +93,20 @@ Viewed ticks persist per branch, so a half-finished review resumes where you
 left it. Ticks are dropped for files that changed after you ticked them.
 Generated files (`-diff` / `linguist-generated` in `.gitattributes`) come
 pre-ticked, as on GitHub.
+
+### Commit by commit
+
+The **COMMITS** pane above the file tree lists the branch's commits, oldest
+first. `<CR>` on one (or `]C` / `[C` from anywhere) narrows the review to that
+commit: the tree holds only its files, BASE shows each file at the commit's
+parent, the right pane shows it as the commit left it (read-only), and the
+description pane carries the commit message. The tip commit keeps the editable
+working file, so its diff also includes any uncommitted edits. `ALL` returns to
+the whole branch.
+
+Viewed ticks are kept per commit, separately from the branch's own; a commit
+whose files are all ticked gets a ✓ in the picker. The AI columns explain the
+branch as a whole, so they are only available with `ALL` selected.
 
 ## The AI comments column
 

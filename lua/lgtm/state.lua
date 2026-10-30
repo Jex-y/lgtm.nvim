@@ -55,14 +55,17 @@ M.content_hash = content_hash
 
 --- A session's slice of the state file.
 --- @param common_dir string shared git dir, from git.common_dir()
---- @param branch string current branch name
+--- @param branch string current branch name, or "<branch>@<sha>" for one commit
+--- @param opts table|nil `immutable` for a commit's own files: they cannot
+---        change, so marks carry no content hash and are never pruned
 local Store = {}
 Store.__index = Store
 
-function M.open(common_dir, branch, root)
+function M.open(common_dir, branch, root, opts)
     local self = setmetatable({}, Store)
     self.key = (common_dir or "?") .. "::" .. (branch or "?")
     self.root = root
+    self.immutable = opts and opts.immutable or false
     self.dirty = false
     local all = read_all()
     local entry = all[self.key]
@@ -95,7 +98,8 @@ end
 
 function Store:set_viewed(path, viewed)
     if viewed then
-        self.files[path] = { viewed = true, sha = content_hash(vim.fs.joinpath(self.root, path)) }
+        local sha = not self.immutable and content_hash(vim.fs.joinpath(self.root, path)) or nil
+        self.files[path] = { viewed = true, sha = sha }
     else
         self.files[path] = nil
     end
