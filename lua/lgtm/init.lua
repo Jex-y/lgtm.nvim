@@ -179,6 +179,10 @@ local defaults = {
         -- last, wrapping.
         next_commit = "]C",
         prev_commit = "[C",
+        -- Approve the selected commit and move on to the next unapproved one.
+        -- In the commit picker, `a` approves the commit under the cursor.
+        approve_commit = "<leader>gy",
+        picker_approve = "a",
         toggle_viewed = "<End>",
         toggle_explain = "<leader>ge",
         -- The reviewer checklist: pick one or many roles to run in parallel.
@@ -264,7 +268,13 @@ local function render_desc()
             session.desc_buf,
             markdown.render_chapter(
                 { title = commit.subject, summary = commit.body },
-                { files = #session.entries, added = commit.added, deleted = commit.deleted, viewed = viewed },
+                {
+                    files = #session.entries,
+                    added = commit.added,
+                    deleted = commit.deleted,
+                    viewed = viewed,
+                    approved = session.approvals:is_approved(commit.id),
+                },
                 width
             )
         )
@@ -400,7 +410,8 @@ local function commit_store(c, is_tip)
     session.commit_stores = session.commit_stores or {}
     local s = session.commit_stores[c.sha]
     if not s then
-        s = state.open(session.common_dir, session.branch .. "@" .. c.sha, session.root, { immutable = not is_tip })
+        -- Keyed by patch id, like approvals, so the ticks survive a rebase.
+        s = state.open(session.common_dir, "commit:" .. c.id, session.root, { immutable = not is_tip })
         session.commit_stores[c.sha] = s
     end
     return s
@@ -420,7 +431,7 @@ local function redraw_commits()
     local rows = {}
     for i, c in ipairs(session.commits) do
         local viewed = commit_store(c, i == #session.commits):count_viewed()
-        table.insert(rows, vim.tbl_extend("force", c, { viewed = viewed }))
+        table.insert(rows, vim.tbl_extend("force", c, { viewed = viewed, approved = session.approvals:is_approved(c.id) }))
     end
     session.commit_map = tree.render_commits(session.commit_buf, {
         commits = rows,
@@ -473,6 +484,13 @@ local function open_commit_picker()
             M._select_commit(item.index ~= 0 and item.index or nil, { focus = true })
         end
     end, { buffer = buf, nowait = true, silent = true, desc = "lgtm: select commit" })
+    vim.keymap.set("n", session.cfg.keys.picker_approve, function()
+        local line = vim.api.nvim_win_get_cursor(win)[1]
+        local item = session and session.commit_map and session.commit_map[line]
+        if item and item.index ~= 0 then
+            M._toggle_approved(item.index, { advance = false })
+        end
+    end, { buffer = buf, nowait = true, silent = true, desc = "lgtm: approve commit under cursor" })
     vim.keymap.set("n", "q", function()
         M.close()
     end, { buffer = buf, nowait = true, silent = true, desc = "lgtm: close session" })
@@ -683,6 +701,45 @@ local function step_commit(delta)
 end
 
 M._step_commit = step_commit
+
+--- Toggle approval of a commit — the selected one unless `idx` is given.
+--- Approving the selected commit moves on to the next unapproved one, unless
+--- `advance` is off.
+--- @param idx number|nil index into session.commits
+--- @param opts table|nil `advance = false` stays put
+local function toggle_approved(idx, opts)
+    if not session_valid() then
+        return
+    end
+    idx = idx or (session.commit and session.commit.index)
+    local c = idx and session.commits[idx]
+    if not c then
+        notify("select a commit to approve")
+        return
+    end
+    local now = session.approvals:toggle(c)
+    local n = #session.commits
+    local follow = now
+        and (not opts or opts.advance ~= false)
+        and session.cfg.advance ~= "none"
+        and session.commit
+        and session.commit.index == idx
+    if follow then
+        for offset = 1, n do
+            local next_idx = ((idx - 1 + offset) % n) + 1
+            if not session.approvals:is_approved(session.commits[next_idx].id) and select_commit(next_idx) then
+                return
+            end
+        end
+        notify(string.format("all %d commits approved", n))
+    end
+    redraw_tree()
+    if session.commit then
+        layout.show_file(session, session.entries[session.index])
+    end
+end
+
+M._toggle_approved = toggle_approved
 
 --- Cycle through the picker from any pane: ALL → chapter 1 → … → chapter n,
 --- wrapping. Chapters that match no real files are stepped over, the same way the
@@ -1023,6 +1080,7 @@ function apply_keys(buf, is_tree)
     map(buf, k.toggle_viewed, toggle_viewed, "toggle viewed")
     map(buf, k.toggle_explain, function() toggle_explain(false) end, "toggle the explanation column")
     map(buf, k.review, review_checklist, "pick AI reviewers")
+    map(buf, k.approve_commit, function() toggle_approved() end, "approve this commit")
     map(buf, k.next_commit, function() step_commit(1) end, "next commit")
     map(buf, k.prev_commit, function() step_commit(-1) end, "previous commit")
     map(buf, k.ask, function() ask.ask(session) end, "ask about this hunk")
@@ -1137,6 +1195,7 @@ function M.open(base_arg, opts)
         -- store, or the selected commit's.
         store = store,
         branch_store = store,
+        approvals = state.approvals(common_dir),
         index = 1,
         folded = {},
     })

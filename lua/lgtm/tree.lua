@@ -19,6 +19,7 @@ local ICONS = {
     -- One per reviewer role with findings on the file, in the role's colour —
     -- the same colour its comments and its legend row wear.
     dot = "●",
+    approved = "✔",
 }
 
 --- Assemble a nested directory structure from a flat list of file entries.
@@ -193,8 +194,9 @@ function M.render_commits(buf, opts)
     local width = opts.width or 40
     local lines, marks, line_map = {}, {}, {}
 
-    local function row(idx, label, sub, counts, selected, done)
-        local marker = selected and ICONS.current or (done and ICONS.viewed or ICONS.unviewed)
+    local function row(idx, label, sub, counts, selected, done, approved)
+        local marker = selected and ICONS.current
+            or (approved and ICONS.approved or (done and ICONS.viewed or ICONS.unviewed))
         local head = string.format(" %s ", marker)
         local tail = counts and ("  " .. counts) or ""
         local room = width - vim.fn.strdisplaywidth(head .. label .. tail) - 2
@@ -209,7 +211,8 @@ function M.render_commits(buf, opts)
         table.insert(lines, text)
         local line = #lines - 1
         line_map[#lines] = { kind = "commit", index = idx }
-        local marker_hl = selected and "LgtmCurrent" or (done and "LgtmViewed" or "Comment")
+        local marker_hl = selected and "LgtmCurrent"
+            or (approved and "LgtmApproved" or (done and "LgtmViewed" or "Comment"))
         table.insert(marks, { line = line, col = 1, end_col = 1 + #marker, hl = marker_hl })
         table.insert(marks, {
             line = line,
@@ -222,7 +225,7 @@ function M.render_commits(buf, opts)
                 line = line,
                 col = #head + #label + 1,
                 end_col = #head + #label + 1 + #sub,
-                hl = done and not selected and "LgtmViewed" or "Normal",
+                hl = (done or approved) and not selected and "LgtmViewed" or "Normal",
             })
         end
         if counts then
@@ -236,10 +239,14 @@ function M.render_commits(buf, opts)
         end
     end
 
-    row(0, "ALL", string.format("%d commits", #(opts.commits or {})), nil, opts.selected == nil, false)
-    for i, c in ipairs(opts.commits or {}) do
+    local commits = opts.commits or {}
+    local approved = #vim.tbl_filter(function(c)
+        return c.approved
+    end, commits)
+    row(0, "ALL", string.format("%d/%d commits approved", approved, #commits), nil, opts.selected == nil, false)
+    for i, c in ipairs(commits) do
         local done = c.files > 0 and c.viewed >= c.files
-        row(i, c.short, c.subject, string.format("+%d −%d", c.added, c.deleted), opts.selected == i, done)
+        row(i, c.short, c.subject, string.format("+%d −%d", c.added, c.deleted), opts.selected == i, done, c.approved)
     end
 
     vim.bo[buf].modifiable = true
@@ -541,6 +548,7 @@ function M.setup_highlights(diff_colors)
     vim.api.nvim_set_hl(0, "LgtmCurrentName", { bold = true })
     vim.api.nvim_set_hl(0, "LgtmCurrent", { fg = colors.accent("add", opts), bold = true })
     vim.api.nvim_set_hl(0, "LgtmViewed", { link = "Comment" })
+    vim.api.nvim_set_hl(0, "LgtmApproved", { fg = colors.accent("add", opts), bold = true })
     vim.api.nvim_set_hl(0, "LgtmCountAdd", { fg = colors.accent("add", opts) })
     vim.api.nvim_set_hl(0, "LgtmCountDel", { fg = colors.accent("delete", opts) })
 end

@@ -469,7 +469,7 @@ function M.render_chapter(chapter, stats, width)
             stats.deleted or 0,
             stats.viewed or 0,
             stats.files or 0
-        )
+        ) .. (stats.approved and "  ·  ✔ approved" or "")
         for _, l in ipairs(M.wrap(meta, width - 2)) do
             table.insert(lines, l)
             table.insert(marks, { line = #lines - 1, hl = "LgtmMdMeta" })

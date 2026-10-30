@@ -135,4 +135,34 @@ function Store:save(base_sha)
     end
 end
 
+--- Approved commits for a repository, keyed by patch id rather than sha, so an
+--- approval outlives a rebase and lapses only when the commit's change does.
+--- Repository-wide rather than per branch: a commit cherry-picked elsewhere
+--- has already been approved.
+local Approvals = {}
+Approvals.__index = Approvals
+
+function M.approvals(common_dir)
+    local self = setmetatable({}, Approvals)
+    self.key = (common_dir or "?") .. "::approved"
+    local entry = read_all()[self.key]
+    self.commits = type(entry) == "table" and entry or {}
+    return self
+end
+
+function Approvals:is_approved(id)
+    return self.commits[id] ~= nil
+end
+
+--- Toggle, save, and report the resulting state.
+--- @param commit table { id, sha, subject }
+function Approvals:toggle(commit)
+    local now = not self:is_approved(commit.id)
+    self.commits[commit.id] = now and { sha = commit.sha, subject = commit.subject, at = os.time() } or nil
+    local all = read_all()
+    all[self.key] = self.commits
+    write_all(all)
+    return now
+end
+
 return M

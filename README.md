@@ -76,6 +76,8 @@ pass one explicitly: `:LgtmEdit origin/release-2`.
 | `M` / `N` | any pane | next / previous chapter of work |
 | `<S-PageDown>` / `<S-PageUp>` | any pane | same, alternate binding |
 | `]C` / `[C` | any pane | next / previous commit (ALL → first → … → last) |
+| `<leader>gy` | any pane | approve the selected commit — advances to the next unapproved one |
+| `a` | commit picker | approve the commit under the cursor |
 | `<End>` | any pane | toggle viewed — ticking advances to the next file |
 | `<leader>ge` | any pane | toggle the AI comments column |
 | `<leader>gw` | any pane | pick AI reviewers (one or many) |
@@ -105,8 +107,15 @@ working file, so its diff also includes any uncommitted edits. `ALL` returns to
 the whole branch.
 
 Viewed ticks are kept per commit, separately from the branch's own; a commit
-whose files are all ticked gets a ✓ in the picker. The AI columns explain the
-branch as a whole, so they are only available with `ALL` selected.
+whose files are all ticked gets a ✓ in the picker. Approving a commit
+(`<leader>gy`) marks it ✔ and moves on to the next unapproved one.
+
+Approvals and per-commit ticks are keyed by `git patch-id`, not the sha, so
+they survive rebases, reorders and amends to *other* commits. When a commit's
+own change moves, its approval lapses and it comes back for review.
+
+The AI columns explain the branch as a whole, so they are only available with
+`ALL` selected.
 
 ## The AI comments column
 
