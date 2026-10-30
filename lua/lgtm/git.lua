@@ -116,7 +116,7 @@ function M.dirty_files(cwd)
     return files
 end
 
-local PR_FIELDS = "number,title,body,author,state,baseRefName,additions,deletions,changedFiles,url,isDraft"
+local PR_FIELDS = "number,title,body,author,state,baseRefName,headRefOid,additions,deletions,changedFiles,url,isDraft"
 
 --- The open PR for `branch`, fetched asynchronously — gh goes to the network, so
 --- a synchronous call would stall the UI on every selection change.
@@ -509,7 +509,37 @@ function M.commits(merge_base, cwd)
             end
         end
     end
+    local ids = M.patch_ids(merge_base, cwd)
+    for _, c in ipairs(commits) do
+        -- A commit with no diff has no patch id; its sha is the only name it has.
+        c.id = ids[c.sha] or c.sha
+    end
     return commits
+end
+
+--- Commit sha -> `git patch-id --stable` for the branch's commits. The patch id
+--- hashes the change itself, so it survives a rebase, an amend of another
+--- commit or a cherry-pick, and moves only when the commit's own diff does.
+function M.patch_ids(merge_base, cwd)
+    local log = vim.system({
+        "git",
+        "log",
+        "-p",
+        "--first-parent",
+        "--diff-merges=first-parent",
+        "--no-color",
+        "--no-ext-diff",
+        merge_base .. "..HEAD",
+    }, { cwd = cwd, text = true }):wait()
+    local ids = {}
+    if log.code ~= 0 then
+        return ids
+    end
+    local res = vim.system({ "git", "patch-id", "--stable" }, { cwd = cwd, text = true, stdin = log.stdout }):wait()
+    for id, sha in (res.stdout or ""):gmatch("(%x+) (%x+)") do
+        ids[sha] = id
+    end
+    return ids
 end
 
 --- A commit's message body, without the subject line.

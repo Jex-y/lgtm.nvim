@@ -6,6 +6,7 @@
 -- exists on the PR's target branch, and the live editable working-tree file.
 
 local ask = require("lgtm.ask")
+local comments = require("lgtm.comments")
 local explain = require("lgtm.explain")
 local git = require("lgtm.git")
 local layout = require("lgtm.layout")
@@ -164,13 +165,10 @@ local defaults = {
     keys = {
         next_file = "<PageDown>",
         prev_file = "<PageUp>",
-        -- m/n rather than ]f/[f: adjacent home-row-adjacent keys, m to the right
-        -- for forward, n to the left for back, so flicking through a review is a
-        -- single finger. Buffer-local to the session's panes — but they do
-        -- shadow Vim's search-repeat inside them. Restore with
-        -- keys = { next_file_alt = "]f", ... } if search-repeat matters more.
-        next_file_alt = "m",
-        prev_file_alt = "n",
+        -- Buffer-local to the session's panes, but <Tab> is <C-i> to the
+        -- terminal, so these shadow jumplist-forward inside them.
+        next_file_alt = "<Tab>",
+        prev_file_alt = "<S-Tab>",
         next_chapter = "<S-PageDown>",
         prev_chapter = "<S-PageUp>",
         next_chapter_alt = "M",
@@ -179,6 +177,10 @@ local defaults = {
         -- last, wrapping.
         next_commit = "]C",
         prev_commit = "[C",
+        -- Approve the selected commit and move on to the next unapproved one.
+        -- In the commit picker, `a` approves the commit under the cursor.
+        approve_commit = "<leader>gy",
+        picker_approve = "a",
         toggle_viewed = "<End>",
         toggle_explain = "<leader>ge",
         -- The reviewer checklist: pick one or many roles to run in parallel.
@@ -186,7 +188,10 @@ local defaults = {
         -- Ask about the hunk under the cursor, or the visually selected lines.
         -- Inside the answer float the same key asks a follow-up.
         ask = "<leader>ga",
-        -- Not "m", which is next-file everywhere now.
+        -- Post a GitHub review comment on the line under the cursor, or the
+        -- visually selected lines. Existing threads show at the end of the
+        -- lines they sit on.
+        comment = "<leader>gn",
         tree_toggle_viewed = "v",
         tree_open = "<CR>",
         tree_fold = "za",
@@ -264,7 +269,13 @@ local function render_desc()
             session.desc_buf,
             markdown.render_chapter(
                 { title = commit.subject, summary = commit.body },
-                { files = #session.entries, added = commit.added, deleted = commit.deleted, viewed = viewed },
+                {
+                    files = #session.entries,
+                    added = commit.added,
+                    deleted = commit.deleted,
+                    viewed = viewed,
+                    approved = session.approvals:is_approved(commit.id),
+                },
                 width
             )
         )
@@ -400,7 +411,8 @@ local function commit_store(c, is_tip)
     session.commit_stores = session.commit_stores or {}
     local s = session.commit_stores[c.sha]
     if not s then
-        s = state.open(session.common_dir, session.branch .. "@" .. c.sha, session.root, { immutable = not is_tip })
+        -- Keyed by patch id, like approvals, so the ticks survive a rebase.
+        s = state.open(session.common_dir, "commit:" .. c.id, session.root, { immutable = not is_tip })
         session.commit_stores[c.sha] = s
     end
     return s
@@ -420,7 +432,7 @@ local function redraw_commits()
     local rows = {}
     for i, c in ipairs(session.commits) do
         local viewed = commit_store(c, i == #session.commits):count_viewed()
-        table.insert(rows, vim.tbl_extend("force", c, { viewed = viewed }))
+        table.insert(rows, vim.tbl_extend("force", c, { viewed = viewed, approved = session.approvals:is_approved(c.id) }))
     end
     session.commit_map = tree.render_commits(session.commit_buf, {
         commits = rows,
@@ -473,6 +485,13 @@ local function open_commit_picker()
             M._select_commit(item.index ~= 0 and item.index or nil, { focus = true })
         end
     end, { buffer = buf, nowait = true, silent = true, desc = "lgtm: select commit" })
+    vim.keymap.set("n", session.cfg.keys.picker_approve, function()
+        local line = vim.api.nvim_win_get_cursor(win)[1]
+        local item = session and session.commit_map and session.commit_map[line]
+        if item and item.index ~= 0 then
+            M._toggle_approved(item.index, { advance = false })
+        end
+    end, { buffer = buf, nowait = true, silent = true, desc = "lgtm: approve commit under cursor" })
     vim.keymap.set("n", "q", function()
         M.close()
     end, { buffer = buf, nowait = true, silent = true, desc = "lgtm: close session" })
@@ -527,6 +546,7 @@ local function goto_index(idx, focus_working)
     -- After show_file, which is what computes session.hunks — the explanation
     -- blocks are keyed to them.
     explain.refresh(session)
+    comments.decorate(session)
     if focus_working ~= false and vim.api.nvim_win_is_valid(session.working_win) then
         vim.api.nvim_set_current_win(session.working_win)
     end
@@ -683,6 +703,45 @@ local function step_commit(delta)
 end
 
 M._step_commit = step_commit
+
+--- Toggle approval of a commit — the selected one unless `idx` is given.
+--- Approving the selected commit moves on to the next unapproved one, unless
+--- `advance` is off.
+--- @param idx number|nil index into session.commits
+--- @param opts table|nil `advance = false` stays put
+local function toggle_approved(idx, opts)
+    if not session_valid() then
+        return
+    end
+    idx = idx or (session.commit and session.commit.index)
+    local c = idx and session.commits[idx]
+    if not c then
+        notify("select a commit to approve")
+        return
+    end
+    local now = session.approvals:toggle(c)
+    local n = #session.commits
+    local follow = now
+        and (not opts or opts.advance ~= false)
+        and session.cfg.advance ~= "none"
+        and session.commit
+        and session.commit.index == idx
+    if follow then
+        for offset = 1, n do
+            local next_idx = ((idx - 1 + offset) % n) + 1
+            if not session.approvals:is_approved(session.commits[next_idx].id) and select_commit(next_idx) then
+                return
+            end
+        end
+        notify(string.format("all %d commits approved", n))
+    end
+    redraw_tree()
+    if session.commit then
+        layout.show_file(session, session.entries[session.index])
+    end
+end
+
+M._toggle_approved = toggle_approved
 
 --- Cycle through the picker from any pane: ALL → chapter 1 → … → chapter n,
 --- wrapping. Chapters that match no real files are stepped over, the same way the
@@ -990,6 +1049,7 @@ local function close_session(force)
     -- Before layout.close: a float left open when its parent tab goes can strand
     -- the window or block the tabclose.
     ask.close(session)
+    comments.clear(session)
     ruler.close(session)
     explain.close_review(session)
     explain.close(session)
@@ -1023,6 +1083,7 @@ function apply_keys(buf, is_tree)
     map(buf, k.toggle_viewed, toggle_viewed, "toggle viewed")
     map(buf, k.toggle_explain, function() toggle_explain(false) end, "toggle the explanation column")
     map(buf, k.review, review_checklist, "pick AI reviewers")
+    map(buf, k.approve_commit, function() toggle_approved() end, "approve this commit")
     map(buf, k.next_commit, function() step_commit(1) end, "next commit")
     map(buf, k.prev_commit, function() step_commit(-1) end, "previous commit")
     map(buf, k.ask, function() ask.ask(session) end, "ask about this hunk")
@@ -1035,6 +1096,16 @@ function apply_keys(buf, is_tree)
             vim.cmd([[execute "normal! \<Esc>"]])
             ask.ask(session, { first = math.min(first, last), last = math.max(first, last), win = win })
         end, { buffer = buf, nowait = true, silent = true, desc = "lgtm: ask about these lines" })
+    end
+    map(buf, k.comment, function() comments.comment(session) end, "comment on this line on GitHub")
+    if k.comment and k.comment ~= "" then
+        vim.keymap.set("x", k.comment, function()
+            local first = vim.fn.line("v")
+            local last = vim.fn.line(".")
+            local win = vim.api.nvim_get_current_win()
+            vim.cmd([[execute "normal! \<Esc>"]])
+            comments.comment(session, { first = math.min(first, last), last = math.max(first, last), win = win })
+        end, { buffer = buf, nowait = true, silent = true, desc = "lgtm: comment on these lines on GitHub" })
     end
     map(buf, k.close, function() close_session(false) end, "close session")
     if is_tree then
@@ -1106,6 +1177,7 @@ function M.open(base_arg, opts)
     markdown.setup_highlights(cfg.diff_colors)
     explain.setup_highlights(cfg.diff_colors)
     ask.setup_highlights()
+    comments.setup_highlights()
     local wins = layout.create(cfg)
 
     -- Tab-local, so a session opened in another worktree gets that directory
@@ -1137,6 +1209,7 @@ function M.open(base_arg, opts)
         -- store, or the selected commit's.
         store = store,
         branch_store = store,
+        approvals = state.approvals(common_dir),
         index = 1,
         folded = {},
     })
@@ -1310,6 +1383,7 @@ function M.open(base_arg, opts)
                     vim.o.fillchars = session.saved_opts.fillchars
                 end
                 ruler.close(session)
+                comments.clear(session)
                 explain.stop_run(session)
                 session = nil
             end
@@ -1331,6 +1405,11 @@ function M.open(base_arg, opts)
         if not session.chapter then
             render_desc()
         end
+        comments.load(session, function()
+            if session_valid() then
+                comments.decorate(session)
+            end
+        end)
     end)
 
     apply_keys(session.tree_buf, true)
@@ -1439,6 +1518,22 @@ function M.setup(opts)
         nargs = "?",
         range = true,
         desc = "Ask the AI about the hunk under the cursor or the given range",
+    })
+
+    vim.api.nvim_create_user_command("LgtmComment", function(args)
+        if not session then
+            vim.notify("lgtm: no session open", vim.log.levels.WARN)
+            return
+        end
+        local opts = { body = args.args ~= "" and args.args or nil }
+        if args.range and args.range > 0 then
+            opts.first, opts.last = args.line1, args.line2
+        end
+        comments.comment(session, opts)
+    end, {
+        nargs = "?",
+        range = true,
+        desc = "Post a GitHub review comment on the cursor line or the given range",
     })
 
     vim.api.nvim_create_user_command("LgtmPr", function(args)

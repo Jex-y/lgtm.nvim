@@ -413,7 +413,9 @@ function M.show_file(session, entry)
             session.working_win,
             session.diff_head and "COMMIT" or "WORKING",
             working_note or status,
-            (session.store:is_viewed(entry.path) and "✓ viewed   " or "") .. position
+            (commit and session.approvals:is_approved(commit.id) and "✔ approved   " or "")
+                .. (session.store:is_viewed(entry.path) and "✓ viewed   " or "")
+                .. position
         )
     )
 end
